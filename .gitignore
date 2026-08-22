@@ -1,0 +1,252 @@
+# ---------------------------------------------------------------------------
+# Secrets and credentials  --  HIGHEST PRIORITY
+# Never commit anything that could authenticate against a real exchange.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+secrets.*
+credentials.*
+*credentials*.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa*
+id_ed25519*
+*.apikey
+api_key*
+apikey*
+*_secret*
+*secret*.toml
+*secret*.yaml
+*secret*.yml
+*secret*.json
+config.local.*
+settings.local.toml
+local.toml
+.netrc
+.pgpass
+.htpasswd
+*.token
+token.json
+service-account*.json
+gcloud-*.json
+aws-credentials*
+.aws/
+.boto
+coinswitch*.json
+coinswitch*.toml
+coinswitch*.ini
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+*.manifest
+*.spec
+
+# Type checkers / linters / formatters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pylint.d/
+.pytest_cache/
+.cache/
+cython_debug/
+
+# Test / coverage artifacts
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+nosetests.xml
+test-results/
+junit*.xml
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.virtualenv/
+__pypackages__/
+.python-version
+Pipfile.lock
+poetry.lock
+pdm.lock
+uv.lock
+
+# ---------------------------------------------------------------------------
+# Node / frontend (reserved for a later stage -- React is NOT part of Stage 1)
+# ---------------------------------------------------------------------------
+node_modules/
+jspm_packages/
+bower_components/
+.npm
+.yarn/
+.yarn-integrity
+.pnp
+.pnp.js
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.next/
+.nuxt/
+.svelte-kit/
+.turbo/
+.parcel-cache/
+.vite/
+storybook-static/
+coverage/
+
+# ---------------------------------------------------------------------------
+# Build artifacts / compiled output
+# ---------------------------------------------------------------------------
+*.o
+*.a
+*.dylib
+*.dll
+*.exe
+*.out
+target/
+out/
+bin/
+obj/
+
+# ---------------------------------------------------------------------------
+# Databases and local persistence
+# (PostgreSQL is NOT part of Stage 1; these are pre-emptive.)
+# ---------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.rdb
+*.dump
+*.sql.gz
+pgdata/
+data/
+!data/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Logs, audit output, runtime state
+# Audit logs may contain account identifiers -- never commit them.
+# ---------------------------------------------------------------------------
+*.log
+logs/
+log/
+audit/
+audit-*.jsonl
+*.jsonl
+!tests/**/fixtures/*.jsonl
+runtime/
+tmp/
+temp/
+*.pid
+*.seed
+*.pid.lock
+state/
+!state/.gitkeep
+
+# ---------------------------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+.ropeproject
+*.swp
+*.swo
+*.swn
+*~
+.\#*
+\#*\#
+.vim/
+.nvim/
+tags
+TAGS
+
+# ---------------------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.AppleDouble
+.LSOverride
+Icon?
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---------------------------------------------------------------------------
+# Jupyter / notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+profile_default/
+ipython_config.py
+
+# ---------------------------------------------------------------------------
+# Local agent/tooling scratch
+# ---------------------------------------------------------------------------
+.claude/.cc-writes/
+.claude/settings.local.json
