@@ -474,6 +474,38 @@ class Price:
         object.__setattr__(self, "amount", value)
         object.__setattr__(self, "currency", currency)
 
+    @classmethod
+    def rounded(
+        cls,
+        amount: object,
+        currency: Currency,
+        *,
+        rounding: str = ROUND_HALF_EVEN,
+        max_scale: int = 12,
+    ) -> "Price":
+        """Construct from a computed amount, rounding explicitly to ``max_scale``.
+
+        The counterpart of :meth:`Money.rounded`, and needed for the same
+        reason: ``prec=34`` arithmetic does not stop at the inputs' precision,
+        so a mean of prices or a volatility-derived stop level routinely carries
+        more decimal places than a price may hold. The constructor refuses such
+        a value on purpose -- rounding a price is a decision, and an implicit one
+        is how a level lands off by a tick (INVARIANT 8). This is where that
+        decision is named.
+
+        Values that already fit are returned exactly as given, so a computation
+        over whole numbers does not acquire twelve trailing zeros.
+        """
+        value = to_decimal(amount, field="price")
+        if _scale_of(value) <= max_scale:
+            return cls(value, currency, max_scale=max_scale)
+        quantum = Decimal(1).scaleb(-max_scale)
+        return cls(
+            value.quantize(quantum, rounding=rounding, context=FINANCIAL_CONTEXT),
+            currency,
+            max_scale=max_scale,
+        )
+
     def notional(
         self, quantity: Quantity, *, rounding: str = ROUND_UP
     ) -> Money:

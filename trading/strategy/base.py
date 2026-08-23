@@ -37,7 +37,7 @@ from ..core.money import Money, Price, Quantity
 from ..core.orders import OrderIntent
 from ..ports.broker import BrokerPort
 
-__all__ = ["MarketView", "Strategy", "StrategyRunner"]
+__all__ = ["MarketView", "Strategy", "StrategyRunner", "refuse_execution_surface"]
 
 #: Attribute names that would give a strategy a way to act rather than propose.
 _EXECUTION_ATTRIBUTES: frozenset[str] = frozenset(
@@ -50,6 +50,35 @@ _EXECUTION_ATTRIBUTES: frozenset[str] = frozenset(
         "send_order",
     }
 )
+
+
+def refuse_execution_surface(strategy: object) -> None:
+    """Reject a strategy holding a way to execute.
+
+    Shallow on purpose: it walks the instance's own ``__dict__`` one level deep.
+    Deeper reachability analysis would be arbitrarily expensive and still
+    defeatable, and the structural guarantee does not rest here -- it rests on
+    :class:`~trading.ports.broker.BrokerPort` requiring a token the strategy
+    layer cannot mint. This check catches the honest mistake of passing a broker
+    into a strategy constructor.
+
+    Module-level so that every proposer-shaped runner shares one implementation.
+    A second copy of a safety check is a second place for it to drift.
+    """
+    for attribute, value in vars(strategy).items():
+        if isinstance(value, (BrokerPort, ExecutionToken)):
+            raise SafetyViolation(
+                f"strategy {type(strategy).__name__} holds "
+                f"{type(value).__name__} in '{attribute}'; strategies may "
+                "not hold an execution surface (INVARIANT 3)"
+            )
+        for forbidden in _EXECUTION_ATTRIBUTES:
+            if callable(getattr(value, forbidden, None)):
+                raise SafetyViolation(
+                    f"strategy {type(strategy).__name__} holds an object "
+                    f"exposing '{forbidden}' in '{attribute}'; strategies "
+                    "propose intents only (INVARIANT 3)"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,29 +172,13 @@ class StrategyRunner:
 
     @staticmethod
     def _refuse_execution_surface(strategy: Strategy) -> None:
-        """Reject a strategy holding a way to execute.
+        """Delegate to :func:`refuse_execution_surface`.
 
-        Shallow on purpose: it walks the instance's own ``__dict__`` one level
-        deep. Deeper reachability analysis would be arbitrarily expensive and
-        still defeatable, and the structural guarantee does not rest here -- it
-        rests on :class:`~trading.ports.broker.BrokerPort` requiring a token the
-        strategy layer cannot mint. This check catches the honest mistake of
-        passing a broker into a strategy constructor.
+        Kept as a method because the rule belongs to the runner conceptually and
+        the existing tests name it here; the implementation is shared with
+        :class:`~trading.strategy.signals.SignalRunner`.
         """
-        for attribute, value in vars(strategy).items():
-            if isinstance(value, (BrokerPort, ExecutionToken)):
-                raise SafetyViolation(
-                    f"strategy {type(strategy).__name__} holds "
-                    f"{type(value).__name__} in '{attribute}'; strategies may "
-                    "not hold an execution surface (INVARIANT 3)"
-                )
-            for forbidden in _EXECUTION_ATTRIBUTES:
-                if callable(getattr(value, forbidden, None)):
-                    raise SafetyViolation(
-                        f"strategy {type(strategy).__name__} holds an object "
-                        f"exposing '{forbidden}' in '{attribute}'; strategies "
-                        "propose intents only (INVARIANT 3)"
-                    )
+        refuse_execution_surface(strategy)
 
     @property
     def strategy_name(self) -> str:
