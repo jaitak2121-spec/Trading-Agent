@@ -57,6 +57,8 @@ class AuditCategory(str, Enum):
     CONFIG = "config"
     MODE = "mode"
     AUTH = "auth"
+    #: A strategy proposing an intent. Distinct from ORDER: nothing exists yet.
+    SIGNAL = "signal"
     ORDER = "order"
     RISK = "risk"
     KILL_SWITCH = "kill_switch"
@@ -71,12 +73,44 @@ class AuditOutcome(str, Enum):
     ERROR = "error"
 
 
-def _coerce(value: Any, redactor: Redactor) -> Any:
+#: Detail keys whose values are structural identifiers, not credentials.
+#:
+#: The redactor's last pattern flags any 32+ character hex run as a probable
+#: secret. That is the right default for text we do not control, but an
+#: idempotency key is a SHA-256 of the intent (INVARIANT 5) and so has exactly
+#: that shape. Redacting it makes every UNKNOWN-order record identical, and
+#: reconciling an UNKNOWN order (INVARIANT 12) means matching a record to one
+#: specific key -- the audit trail would lose the one field it exists to carry.
+#:
+#: Narrow on purpose, and not an exemption from redaction: values under these
+#: keys still have registered secrets scrubbed and still run every
+#: self-labelling credential pattern. Only the shape-based heuristic is skipped.
+#: Two omissions are deliberate. ``key`` is a generic name used for actual
+#: credentials elsewhere, and the ambiguity resolves in favour of redacting.
+#: ``token_id`` names a *capability*, not an identifier -- ``ExecutionToken``
+#: truncates it even in its own ``repr`` -- so it stays redacted.
+_IDENTIFIER_KEYS: Final = frozenset(
+    {"idempotency_key", "order_id", "broker_order_id", "approval_id"}
+)
+
+
+def _redact_detail(text: str, redactor: Redactor, key: str | None) -> str:
+    """Scrub a detail value, respecting :data:`_IDENTIFIER_KEYS`."""
+    if key in _IDENTIFIER_KEYS:
+        return redactor.redact_identifier(text)
+    return redactor.redact(text)
+
+
+def _coerce(value: Any, redactor: Redactor, key: str | None = None) -> Any:
     """Convert ``value`` into something canonically JSON-serialisable.
 
     ``Decimal`` and the money types become strings so exactness survives the
     round trip -- ``json`` would otherwise turn them into floats and quietly
     violate INVARIANT 8 inside the audit trail itself.
+
+    ``key`` is the detail name the value was filed under, propagated so that
+    :data:`_IDENTIFIER_KEYS` can be honoured at any nesting depth -- the gateway
+    nests a broker ack's fields one level down.
     """
     if isinstance(value, Secret):
         return REDACTED
@@ -92,19 +126,24 @@ def _coerce(value: Any, redactor: Redactor) -> Any:
         # field that a later consumer might parse back as money.
         return f"{value!r}"
     if isinstance(value, str):
-        return redactor.redact(value)
+        return _redact_detail(value, redactor, key)
     if isinstance(value, Enum):
-        return _coerce(value.value, redactor)
+        return _coerce(value.value, redactor, key)
     if isinstance(value, _dt.datetime):
         return value.astimezone(_dt.timezone.utc).isoformat()
     if isinstance(value, Mapping):
-        return {str(k): _coerce(v, redactor) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+        return {
+            str(k): _coerce(v, redactor, str(k))
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        }
     if isinstance(value, (list, tuple, set, frozenset)):
         items = list(value)
         if isinstance(value, (set, frozenset)):
             items = sorted(items, key=str)
-        return [_coerce(v, redactor) for v in items]
-    return redactor.redact(str(value))
+        # The key carries into the elements: a list filed under an identifier
+        # name is a list of identifiers.
+        return [_coerce(v, redactor, key) for v in items]
+    return _redact_detail(str(value), redactor, key)
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> str:

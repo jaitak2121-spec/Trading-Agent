@@ -19,6 +19,7 @@ from trading.core.audit import (
     InMemoryAuditSink,
     JsonlFileAuditSink,
     MultiSink,
+    _IDENTIFIER_KEYS,
 )
 from trading.core.clock import ManualClock
 from trading.core.money import USD, Money, Quantity
@@ -163,6 +164,95 @@ class TestAuditRedaction(unittest.TestCase):
             AuditCategory.AUTH, "call", details={"outer": {"inner": SECRET_VALUE}}
         )
         self.assertNotIn(SECRET_VALUE, self.sink.rendered())
+
+
+class TestIdentifiersSurviveRedaction(unittest.TestCase):
+    """Redaction must not eat the identifiers the trail exists to carry.
+
+    The redactor treats any 32+ character hex run as a probable secret, which is
+    correct for text we do not control. An idempotency key is a SHA-256 of the
+    intent (INVARIANT 5) and has exactly that shape, so the naive reading makes
+    every UNKNOWN-order record identical -- and reconciling an UNKNOWN order
+    (INVARIANT 12) means matching a record to one specific key.
+
+    The allowlist is keyed on the *field name*, not the value, and it narrows
+    exactly one heuristic. Everything below the divider proves what it does not
+    weaken.
+    """
+
+    #: Shaped exactly like a real idempotency key: 64 lowercase hex characters.
+    KEY = "c" * 64
+
+    def setUp(self):
+        global_redactor().forget_all()
+        self.sink = InMemoryAuditSink()
+        self.log = AuditLog(self.sink, clock=ManualClock())
+
+    def tearDown(self):
+        global_redactor().forget_all()
+
+    def record(self, details):
+        return self.log.record(AuditCategory.ORDER, "submit", details=details)
+
+    def test_an_idempotency_key_reaches_the_record_intact(self):
+        rec = self.record({"idempotency_key": self.KEY})
+        self.assertEqual(rec.details["idempotency_key"], self.KEY)
+
+    def test_it_also_survives_serialisation(self):
+        self.record({"idempotency_key": self.KEY})
+        self.assertIn(self.KEY, self.sink.rendered())
+
+    def test_a_nested_identifier_survives(self):
+        """The gateway files a broker ack's fields one level down."""
+        rec = self.record({"ack": {"broker_order_id": self.KEY}})
+        self.assertEqual(rec.details["ack"]["broker_order_id"], self.KEY)
+
+    def test_an_identifier_inside_a_list_survives(self):
+        rec = self.record({"order_id": [self.KEY, self.KEY]})
+        self.assertEqual(rec.details["order_id"], [self.KEY, self.KEY])
+
+    def test_every_allowlisted_name_is_one_the_code_actually_files_under(self):
+        """Guards against the set drifting into dead or speculative entries."""
+        for name in _IDENTIFIER_KEYS:
+            with self.subTest(name=name):
+                rec = self.record({name: self.KEY})
+                self.assertEqual(rec.details[name], self.KEY)
+
+    # -- what the allowlist does NOT weaken --------------------------------
+
+    def test_the_same_value_under_an_unlisted_key_is_still_redacted(self):
+        """Proof the exemption is by field name, not by value shape."""
+        rec = self.record({"blob": self.KEY})
+        self.assertEqual(rec.details["blob"], REDACTED)
+
+    def test_a_generic_key_field_is_still_redacted(self):
+        """``key`` is ambiguous, and ambiguity resolves in favour of redacting."""
+        rec = self.record({"key": self.KEY})
+        self.assertEqual(rec.details["key"], REDACTED)
+
+    def test_a_token_id_is_still_redacted(self):
+        """A capability is not an identifier, however hex-shaped it looks."""
+        rec = self.record({"token_id": self.KEY})
+        self.assertEqual(rec.details["token_id"], REDACTED)
+
+    def test_a_registered_secret_under_an_identifier_key_is_still_scrubbed(self):
+        Secret(SECRET_VALUE)
+        rec = self.record({"order_id": f"ORD-{SECRET_VALUE}"})
+        self.assertNotIn(SECRET_VALUE, rec.details["order_id"])
+
+    def test_a_self_labelling_credential_under_an_identifier_key_is_scrubbed(self):
+        rec = self.record({"order_id": "Bearer qqqq1111wwww2222"})
+        self.assertNotIn("qqqq1111wwww2222", rec.details["order_id"])
+
+    def test_a_secret_object_under_an_identifier_key_is_still_redacted(self):
+        rec = self.record({"order_id": Secret(SECRET_VALUE)})
+        self.assertEqual(rec.details["order_id"], REDACTED)
+
+    def test_the_hash_chain_is_unaffected(self):
+        """Hashes are computed after coercion, so the chain still verifies."""
+        self.record({"idempotency_key": self.KEY})
+        self.record({"idempotency_key": "d" * 64})
+        self.log.verify()
 
 
 class TestHashChain(unittest.TestCase):
