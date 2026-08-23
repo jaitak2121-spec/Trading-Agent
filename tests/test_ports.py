@@ -5,11 +5,11 @@ implements is decoration: it drifts from the class it is supposed to describe,
 and the drift is invisible until Stage 2 writes a second implementation against
 a stale interface.
 
-Two of the four ports cannot use inheritance to declare conformance --
+Two of the ports cannot use inheritance to declare conformance --
 ``trading.ports.broker`` imports ``trading.core.orders`` at runtime, so an
 ``OrderStore(OrderRepositoryPort)`` base class would close an import cycle. They
 use ``ABCMeta.register`` instead, which grants the ``issubclass`` relationship
-and enforces nothing. This module supplies the enforcement, for all four ports
+and enforces nothing. This module supplies the enforcement, for every port
 uniformly, and it is stronger than inheritance would be: inheritance notices a
 *missing* method, while these tests also notice a *changed* one.
 """
@@ -21,7 +21,11 @@ import inspect
 import unittest
 from decimal import Decimal
 
-from trading.adapters.memory import SimulatedBroker, StaticMarketData
+from trading.adapters.memory import (
+    InMemoryQuoteFeed,
+    SimulatedBroker,
+    StaticMarketData,
+)
 from trading.core.clock import ManualClock
 from trading.core.money import USD, Price
 from trading.core.orders import OrderStore
@@ -31,6 +35,7 @@ from trading.ports import (
     MarketDataPort,
     OrderRepositoryPort,
     PositionRepositoryPort,
+    QuoteFeedPort,
 )
 
 #: Every port, paired with the Stage 1 class that implements it. A port missing
@@ -42,6 +47,7 @@ PORT_IMPLEMENTATIONS = [
     (PositionRepositoryPort, PositionLedger),
     (BrokerPort, SimulatedBroker),
     (MarketDataPort, StaticMarketData),
+    (QuoteFeedPort, InMemoryQuoteFeed),
 ]
 
 
@@ -201,6 +207,12 @@ class TestInstancesSatisfyIsinstance(unittest.TestCase):
     def test_a_feed_instance_is_a_market_data_port(self):
         feed = StaticMarketData({"BTCUSD": Price("50000", USD)})
         self.assertIsInstance(feed, MarketDataPort)
+
+    def test_a_quote_feed_instance_is_a_quote_feed_port(self):
+        """``FreshMarkPrices`` isinstance-checks its feed, so pin the relationship."""
+        self.assertIsInstance(
+            InMemoryQuoteFeed(clock=ManualClock()), QuoteFeedPort
+        )
 
 
 class TestPortsHoldNoInfrastructure(unittest.TestCase):

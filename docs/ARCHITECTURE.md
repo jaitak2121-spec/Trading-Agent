@@ -1,7 +1,12 @@
 # Architecture
 
-Stage 1 of a modular monolith. This document describes what exists on disk
-today, not a plan. Where something is deliberately absent, it says so.
+A modular monolith. This document describes what exists on disk today, not a
+plan. Where something is deliberately absent, it says so.
+
+Stage 1 (the safety kernel) is complete. Stage 2 (the trading platform on top of
+it) is in progress; sections marked **Stage 2** grow as subsystems land, and the
+counts in §3 and §7 are re-measured at the end of the stage rather than after
+every batch.
 
 Referenced from `trading/__init__.py`.
 
@@ -30,8 +35,8 @@ convention — see §4.
 
 **What Stage 1 does ship:** the full safety chain, exercised end to end against
 an in-process venue that misbehaves on purpose. Thirteen numbered invariants,
-each enforced in code and asserted in tests. 948 tests, stdlib `unittest` only,
-95% statement coverage.
+each enforced in code and asserted in tests. Stdlib `unittest` only,
+95%+ statement coverage.
 
 ---
 
@@ -87,7 +92,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (3 604 statements)
+### `trading.core` — the safety kernel (3 880 statements)
 
 | Module | What it owns |
 |---|---|
@@ -107,15 +112,18 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 | `risk.py` | `RiskEngine` and `RiskApproval`. Approvals are single-use capabilities. |
 | `sizing.py` | `PositionSizer`. Rounds down, always; verifies the result rather than trusting the arithmetic. |
 | `gateway.py` | **`ExecutionGateway` — the one place an order can leave this system.** |
+| `marketdata.py` | **Stage 2.** `Quote`, `Candle`, `MarketSnapshot`, `StalenessPolicy`, and `FreshMarkPrices` — the bridge that turns a stale quote into an absent mark price. |
 
 `trading/core/__init__.py` re-exports nothing. Callers import from the specific
 module, so an import line says which control is in play.
 
-### `trading.ports` — interfaces only (123 statements)
+### `trading.ports` — interfaces only (137 statements)
 
-`BrokerPort`, `MarketDataPort`, `OrderRepositoryPort`, `PositionRepositoryPort`.
-Every one is abstract and every abstract method body is `...` or `pass` —
-`test_ports.py` asserts that by AST, so a port cannot quietly acquire logic.
+`BrokerPort`, `MarketDataPort`, `QuoteFeedPort`, `OrderRepositoryPort`,
+`PositionRepositoryPort`. Every one is abstract and every abstract method body is
+`...` or `pass` — `test_ports.py` asserts that by AST, so a port cannot quietly
+acquire logic. It also pairs every exported port with a concrete implementation,
+so a port nothing satisfies cannot be added.
 
 The repository ports declare their conformance with `ABCMeta.register()` rather
 than by inheritance:
@@ -136,12 +144,14 @@ not the whole guarantee. `test_ports.py` checks that every abstract method
 exists on each implementation *with a compatible signature* — strictly stronger
 than inheritance, which would notice a missing method but not a changed one.
 
-### `trading.adapters.memory` — the only adapters in Stage 1 (185 statements)
+### `trading.adapters.memory` — the only adapters (287 statements)
 
-`SimulatedBroker` and `StaticMarketData`. Deterministic, offline, clock
-injected. The broker can be scripted to reject, to answer `UNCERTAIN`, or to
-raise after the request has left — the failure modes that matter are the ones
-that are hard to reach against a real venue.
+`SimulatedBroker`, `StaticMarketData`, and (Stage 2) `InMemoryQuoteFeed`.
+Deterministic, offline, clock injected. The broker can be scripted to reject, to
+answer `UNCERTAIN`, or to raise after the request has left; the quote feed can
+freeze, go dark, deliver ticks out of order, or stamp them in the future. The
+failure modes that matter are the ones that are hard to reach against a real
+venue.
 
 ### `trading.strategy` — proposals only (109 statements)
 
@@ -272,10 +282,11 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-948 tests, ~3 s, 95% statement coverage (4 025 statements, 196 missed).
+1 044 tests, ~3 s, 95.6% statement coverage (4 415 statements, 196 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
+| `test_marketdata.py` | 95 | Quote/candle validation, staleness, the frozen-feed refusal |
 | `test_gateway.py` | 89 | Each gate's refusal, and the chain ordering |
 | `test_invariants_end_to_end.py` | 79 | All thirteen invariants on a wired system |
 | `test_dedupe_reconciliation.py` | 75 | Idempotency keys, UNKNOWN, mismatch, staleness |
@@ -293,7 +304,7 @@ python3 -m unittest discover -s tests -t .
 | `test_authz.py` | 34 | Role matrix, token single-use and TTL |
 | `test_modes.py` | 34 | Transition table |
 | `test_clock.py` | 33 | `SystemClock` and `ManualClock` |
-| `test_ports.py` | 21 | Ports abstract; implementations conform by signature |
+| `test_ports.py` | 22 | Ports abstract; implementations conform by signature |
 
 Coverage is measured with the stdlib `trace` module, since `coverage.py` would be
 a third-party dependency. Do **not** read the figure off `trace --summary`: its
@@ -340,7 +351,7 @@ Every seam is already named. Nothing in `trading.core` changes.
 |---|---|---|
 | PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. |
 | CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `SimulatedBroker` is the reference. |
-| Live price feed | `MarketDataPort` | Must return `Price`, never `float`. |
+| Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |
 | Real strategies | `trading.strategy` | Subclass `Strategy`; the runner's tripwire applies. |

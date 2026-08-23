@@ -13,9 +13,11 @@ from __future__ import annotations
 
 from .broker import BrokerFailure, ScriptedAck, SimulatedBroker
 from .market_data import StaticMarketData
+from .quote_feed import InMemoryQuoteFeed
 
 __all__ = [
     "BrokerFailure",
+    "InMemoryQuoteFeed",
     "ScriptedAck",
     "SimulatedBroker",
     "StaticMarketData",

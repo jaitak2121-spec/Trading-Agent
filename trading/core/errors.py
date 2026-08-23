@@ -30,6 +30,7 @@ __all__ = [
     "UnknownOrderStateBlocked",
     "ReconciliationRequired",
     "PositionMismatch",
+    "StaleMarketData",
     "StrategyExecutionForbidden",
 ]
 
@@ -113,3 +114,17 @@ class ReconciliationRequired(SafetyViolation):
 
 class PositionMismatch(SafetyViolation):
     """INVARIANT 6: local and broker positions disagree."""
+
+
+class StaleMarketData(SafetyViolation):
+    """A decision was asked for using market data too old to support it.
+
+    A :class:`SafetyViolation` rather than a plain error because acting on a
+    price of unknown age is a safety failure, not a data inconvenience.
+
+    Raised by callers that have no gate to refuse on their behalf -- chiefly
+    advisory code. On the execution path a stale quote is instead reported as an
+    *absent* mark price by
+    :class:`~trading.core.marketdata.FreshMarkPrices`, which the risk engine
+    already refuses on. Both routes fail closed; only the loudness differs.
+    """
