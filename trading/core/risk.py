@@ -24,8 +24,14 @@ passed".
 
 **Reducing orders are not blocked by exposure limits.** Projected exposure is
 computed with signs, so an order that closes a position is judged on the
-exposure it leaves behind. Blocking exits because exposure is already high would
-be a safety hazard of its own.
+exposure it leaves behind. An order that *strictly shrinks* a position without
+flipping its sign is treated as de-risking: the position, gross-exposure, and
+daily-loss limits are waived for it and the waiver is audited. A position can
+sit above a ceiling because the ceiling was tightened or because it was adopted
+from the broker during reconciliation, and refusing every exit would trap the
+operator in exactly the position the limit exists to prevent. The per-order,
+rate, and open-order limits still apply -- those are transient, so being
+throttled for a minute is not a trap.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from .audit import AuditCategory, AuditLog, AuditOutcome
 from .authz import Action, Principal, authorize, is_authorized
 from .clock import Clock
 from .config import RiskConfig
-from .errors import RiskLimitExceeded, UnauthorizedAction
+from .errors import RiskLimitExceeded, SafetyViolation, UnauthorizedAction
 from .money import FINANCIAL_CONTEXT, Money, Price, Quantity
 from .orders import OrderIntent, OrderSide, OrderStore
 
@@ -413,6 +419,7 @@ class RiskEngine:
         with self._lock:
             breaches: list[LimitBreach] = []
             checked: list[RiskLimit] = []
+            waived: list[RiskLimit] = []
             config = self._config
             symbol = intent.symbol
 
@@ -467,6 +474,16 @@ class RiskEngine:
             #    is judged on what it leaves behind.
             checked.append(RiskLimit.POSITION_NOTIONAL)
             current = positions.get(symbol, Quantity.zero(intent.quantity.asset))
+            # Incoherent inputs, not a risk condition: if the ledger thinks
+            # BTCUSD is denominated in ETH, the position data cannot be trusted
+            # and no arithmetic on it means anything. Refuse loudly rather than
+            # letting a CurrencyMismatch escape as an unexpected error.
+            if current.asset != intent.quantity.asset:
+                raise SafetyViolation(
+                    f"position for {symbol} is held in {current.asset} but the order "
+                    f"is in {intent.quantity.asset}; refusing to evaluate risk "
+                    "against inconsistent position data"
+                )
             delta = (
                 intent.quantity
                 if intent.side is OrderSide.BUY
@@ -474,53 +491,82 @@ class RiskEngine:
             )
             projected = current + delta
             projected_notional = self._notional(projected, entry_price)
-            if projected_notional > config.max_position_notional:
-                breaches.append(
-                    LimitBreach(
-                        limit=RiskLimit.POSITION_NOTIONAL,
-                        message=(
-                            f"resulting {symbol} position {projected.amount} would be "
-                            f"worth {projected_notional}, over the per-position "
-                            f"ceiling {config.max_position_notional}"
-                        ),
-                        observed=str(projected_notional),
-                        allowed=str(config.max_position_notional),
-                    )
+
+            # An order that strictly shrinks an existing position, without
+            # flipping its sign, is a de-risking order. Standing limits must not
+            # block it: a position can be above a ceiling because the ceiling was
+            # tightened or because it was adopted from the broker during
+            # reconciliation, and refusing every exit would trap the operator in
+            # exactly the position the limit exists to prevent.
+            #
+            # The no-sign-flip condition matters. Selling 0.017 of a 0.009 long
+            # shrinks the magnitude but opens a fresh 0.008 short, which is a new
+            # position and is judged on the ceiling like any other.
+            reduces_position = (
+                abs(projected.amount) < abs(current.amount)
+                and (
+                    projected.amount == 0
+                    or (projected.amount > 0) == (current.amount > 0)
                 )
+            )
+
+            if projected_notional > config.max_position_notional:
+                if reduces_position:
+                    waived.append(RiskLimit.POSITION_NOTIONAL)
+                else:
+                    breaches.append(
+                        LimitBreach(
+                            limit=RiskLimit.POSITION_NOTIONAL,
+                            message=(
+                                f"resulting {symbol} position {projected.amount} would "
+                                f"be worth {projected_notional}, over the per-position "
+                                f"ceiling {config.max_position_notional}"
+                            ),
+                            observed=str(projected_notional),
+                            allowed=str(config.max_position_notional),
+                        )
+                    )
 
             # 4. Gross exposure across every symbol.
             checked.append(RiskLimit.GROSS_EXPOSURE)
             current_notional = self._notional(current, entry_price)
             projected_gross = gross_before - current_notional + projected_notional
             if projected_gross > config.max_gross_exposure:
-                breaches.append(
-                    LimitBreach(
-                        limit=RiskLimit.GROSS_EXPOSURE,
-                        message=(
-                            f"resulting gross exposure {projected_gross} exceeds "
-                            f"{config.max_gross_exposure}"
-                        ),
-                        observed=str(projected_gross),
-                        allowed=str(config.max_gross_exposure),
+                if reduces_position:
+                    waived.append(RiskLimit.GROSS_EXPOSURE)
+                else:
+                    breaches.append(
+                        LimitBreach(
+                            limit=RiskLimit.GROSS_EXPOSURE,
+                            message=(
+                                f"resulting gross exposure {projected_gross} exceeds "
+                                f"{config.max_gross_exposure}"
+                            ),
+                            observed=str(projected_gross),
+                            allowed=str(config.max_gross_exposure),
+                        )
                     )
-                )
 
-            # 5. Daily loss budget.
+            # 5. Daily loss budget. Also waived for de-risking orders -- having
+            #    spent the day's loss budget must not mean being unable to close.
             checked.append(RiskLimit.DAILY_LOSS)
             loss = self._pnl.realized_loss
             if loss >= config.max_daily_loss:
-                breaches.append(
-                    LimitBreach(
-                        limit=RiskLimit.DAILY_LOSS,
-                        message=(
-                            f"today's realized loss {loss} has reached the daily "
-                            f"budget {config.max_daily_loss}; no further orders "
-                            "today"
-                        ),
-                        observed=str(loss),
-                        allowed=str(config.max_daily_loss),
+                if reduces_position:
+                    waived.append(RiskLimit.DAILY_LOSS)
+                else:
+                    breaches.append(
+                        LimitBreach(
+                            limit=RiskLimit.DAILY_LOSS,
+                            message=(
+                                f"today's realized loss {loss} has reached the daily "
+                                f"budget {config.max_daily_loss}; no further orders "
+                                "today"
+                            ),
+                            observed=str(loss),
+                            allowed=str(config.max_daily_loss),
+                        )
                     )
-                )
 
             # 6. Submission rate.
             checked.append(RiskLimit.ORDER_RATE)
@@ -579,6 +625,8 @@ class RiskEngine:
                     "order_notional": str(order_notional.amount),
                     "projected_gross_exposure": str(projected_gross.amount),
                     "checks": [c.value for c in checked],
+                    # Loud, because an over-limit order was permitted here.
+                    "waived_as_de_risking": [w.value for w in waived],
                 },
             )
             return approval
