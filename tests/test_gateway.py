@@ -31,7 +31,7 @@ from trading.core.gateway import ExecutionGate, ExecutionGateway, ExecutionOutco
 from trading.core.modes import TradingMode
 from trading.core.money import USD, Money, Price, Quantity
 from trading.core.orders import OrderSide, OrderState
-from trading.ports.broker import AckOutcome, BrokerAck
+from trading.ports.broker import AckOutcome, BrokerAck, BrokerPositionSnapshot
 
 
 class GatewayFixture(unittest.TestCase):
@@ -338,7 +338,7 @@ class TestReconciliationGate(GatewayFixture):
     def test_a_position_mismatch_blocks_orders(self):
         self.rig.broker.set_venue_position(SYMBOL, Quantity("5", ASSET))
         self.rig.reconciliation.reconcile(
-            self.rig.broker.fetch_positions().positions
+            self.rig.gateway._broker.fetch_positions().positions
         )
         result = self.rig.submit()
         self.assertRefusedAt(result, ExecutionGate.RECONCILIATION)
@@ -347,7 +347,7 @@ class TestReconciliationGate(GatewayFixture):
     def test_clearing_a_mismatch_restores_execution(self):
         self.rig.broker.set_venue_position(SYMBOL, Quantity("5", ASSET))
         self.rig.reconciliation.reconcile(
-            self.rig.broker.fetch_positions().positions
+            self.rig.gateway._broker.fetch_positions().positions
         )
         # Adopt the venue's truth, then clear against a fresh snapshot.
         self.rig.positions.set_position(SYMBOL, Quantity("5", ASSET))
@@ -363,7 +363,7 @@ class TestReconciliationGate(GatewayFixture):
     def test_a_refusal_here_releases_the_key(self):
         self.rig.broker.set_venue_position(SYMBOL, Quantity("5", ASSET))
         self.rig.reconciliation.reconcile(
-            self.rig.broker.fetch_positions().positions
+            self.rig.gateway._broker.fetch_positions().positions
         )
         intent = self.rig.intent()
         self.rig.submit(intent)
@@ -613,6 +613,99 @@ class TestResolvingUnknown(GatewayFixture):
         self.assertTrue(self.rig.orders.has_unknown_orders())
 
 
+class TestResolvingUnknownToAFill(GatewayFixture):
+    """The recovery path that mutates positions.
+
+    Our request timed out, and by the time we ask, the venue has already filled
+    it. This is the branch that costs money if it is wrong: it is the only place
+    the position ledger moves without an order having been *observed* to fill, so
+    a bug here means our idea of the position silently diverges from the venue's.
+
+    ``SimulatedBroker`` cannot reach it on its own -- it rewrites an
+    uncertain-but-landed order to ACCEPTED, deliberately, so the ordinary path
+    stays conservative. Reaching FILLED needs a venue that fills between our
+    timeout and our question, which is what the stub below is.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.filled_quantity = Quantity("0.001", ASSET)
+        self.order = self._make_unknown()
+        self.rig.gateway._broker = self._venue_that_filled_it()
+
+    def _make_unknown(self):
+        self.rig.broker.script(
+            BrokerAck(AckOutcome.UNCERTAIN, message="timeout"), lands_at_venue=True
+        )
+        return self.rig.submit().order
+
+    def _venue_that_filled_it(self):
+        ack = BrokerAck(
+            AckOutcome.FILLED,
+            broker_order_id="venue-filled-1",
+            filled_quantity=self.filled_quantity,
+            fill_price=Price("50000", USD),
+        )
+        # Consistent about both questions: the order filled, and the position
+        # exists. A stub that answered only the first would make the
+        # reconciliation assertion below meaningless.
+        snapshot = BrokerPositionSnapshot({SYMBOL: self.filled_quantity})
+
+        class VenueFilledIt:
+            def fetch_order_state(self, order):
+                return ack
+
+            def fetch_positions(self):
+                return snapshot
+
+        return VenueFilledIt()
+
+    def test_the_order_reaches_filled(self):
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.assertEqual(self.order.state, OrderState.FILLED)
+
+    def test_the_discovered_fill_reaches_the_position_ledger(self):
+        """The assertion that matters: our books learn about the fill."""
+        before = self.rig.positions.position(SYMBOL, asset=ASSET)
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.assertEqual(
+            self.rig.positions.position(SYMBOL, asset=ASSET),
+            before + self.filled_quantity,
+        )
+
+    def test_the_fill_price_and_quantity_are_recorded_on_the_order(self):
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.assertEqual(self.order.filled_quantity, self.filled_quantity)
+
+    def test_resolution_unblocks_new_orders(self):
+        self.assertRefusedAt(self.rig.submit(), ExecutionGate.RECONCILIATION)
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.assertFalse(self.rig.orders.has_unknown_orders())
+
+    def test_a_discovered_fill_still_requires_the_reconcile_permission(self):
+        with self.assertRaises(UnauthorizedAction):
+            self.rig.gateway.resolve_unknown(
+                self.order, operator=self.rig.strategy_id
+            )
+        self.assertEqual(self.order.state, OrderState.UNKNOWN)
+
+    def test_the_recovery_is_audited_and_the_chain_survives(self):
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.rig.audit.verify()
+        self.assertTrue(
+            any("reconcil" in action for action in self.rig.actions()),
+            f"no reconciliation was audited: {self.rig.actions()}",
+        )
+
+    def test_reconciling_against_the_venue_now_agrees(self):
+        """The point of applying the fill: our books match the venue's again."""
+        self.rig.gateway.resolve_unknown(self.order, operator=self.rig.operator_id)
+        self.rig.reconciliation.reconcile(
+            self.rig.gateway._broker.fetch_positions().positions
+        )
+        self.assertFalse(self.rig.reconciliation.has_mismatch)
+
+
 class TestChainOrdering(GatewayFixture):
     """The chain's order is load-bearing, so it is asserted directly.
 
@@ -660,7 +753,7 @@ class TestChainOrdering(GatewayFixture):
     def test_reconciliation_precedes_the_risk_check(self):
         self.rig.broker.set_venue_position(SYMBOL, Quantity("5", ASSET))
         self.rig.reconciliation.reconcile(
-            self.rig.broker.fetch_positions().positions
+            self.rig.gateway._broker.fetch_positions().positions
         )
         result = self.rig.submit(quantity="0.5")  # also over the risk limit
         self.assertRefusedAt(result, ExecutionGate.RECONCILIATION)
