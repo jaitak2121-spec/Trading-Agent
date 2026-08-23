@@ -48,7 +48,7 @@ coinswitch*.ini
 # (INVARIANT 9) and its test. These exceptions must stay LAST in this block --
 # gitignore resolves to the final matching pattern, so an earlier "!" would be
 # overridden by "*_secret*" below it. Without them a fresh clone silently loses
-# trading/core/secrets.py and 68 tests, and the suite fails on import.
+# trading/core/secrets.py and 37 tests, and the suite fails on import.
 !secrets.py
 !test_secrets.py
 
