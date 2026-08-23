@@ -324,6 +324,30 @@ Neither is a guarantee. Specifically:
 the key in use" from logs alone. It is a truncated SHA-256 — a correlation tag,
 not a proof of possession.
 
+### Staleness detection depends on a timestamp we did not produce
+
+`StalenessPolicy` compares a quote's `as_of` against our own clock, and `as_of`
+comes from outside the process. Three consequences, none of them fixable inside
+this codebase:
+
+- **A venue that stamps quotes with its own send time and runs slow** makes fresh
+  data look old. That direction is safe — it refuses.
+- **A venue that stamps with a clock running fast** makes old data look fresh, so
+  the policy treats a timestamp more than `FUTURE_TOLERANCE_SECONDS` ahead of us
+  as *stale* rather than as maximally fresh. Without that rule, a fast venue
+  clock would keep a frozen feed looking alive indefinitely.
+- **An adapter that stamps `as_of` with "now" on receipt** defeats the check
+  entirely: a replayed or queued message becomes indistinguishable from a live
+  one. `QuoteFeedPort`'s docstring forbids it, and nothing mechanical can enforce
+  it, so it is a review obligation on every new feed adapter.
+
+What the mechanism *does* guarantee is that a frozen feed cannot reach the risk
+engine as a usable price: `FreshMarkPrices` reports a failing quote as absent, and
+absence is already a refusal (gate 8, `RiskLimit.MARK_PRICE_AVAILABLE`). Note that
+this refusal is deliberately **not latching** — unlike the kill switch or the
+mismatch gate — because a stale tick is an ordinary operational event, and
+requiring an operator to clear each one would turn every hiccup into an outage.
+
 ### What Stage 1 does not defend against at all
 
 - **Anything requiring a process boundary** — see capability isolation above.
@@ -332,10 +356,10 @@ not a proof of possession.
   block that `UNKNOWN` was providing. This is the single largest gap, and it is
   why `OrderRepositoryPort` and `PositionRepositoryPort` exist as seams.
 - **Concurrency across processes.** Within one process every mutable control
-  holds a `threading.Lock` (twelve of the sixteen core modules; the other four
-  are immutable value types and a pure calculator, `ManualClock` included in the
-  locked set). Two processes sharing a venue account would each believe they hold
-  the only lock.
+  holds a `threading.Lock` (thirteen of the seventeen core modules; the other
+  four — `config`, `errors`, `money`, `sizing` — are immutable value types, the
+  exception hierarchy, and a pure calculator). Two processes sharing a venue
+  account would each believe they hold the only lock.
 - **Clock trust.** `SystemClock` reads the host clock. A host whose monotonic
   clock is broken defeats every cooldown. Tests prove the code does not depend on
   *wall* clock, which is the failure mode that actually occurs.
@@ -422,7 +446,7 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 948
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 044
    tests in ~3 s. There is no reason to run a subset.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and

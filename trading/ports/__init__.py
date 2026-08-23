@@ -19,7 +19,7 @@ strategy even if the strategy somehow gets a reference to it (INVARIANT 3).
 from __future__ import annotations
 
 from .broker import BrokerAck, BrokerPort, BrokerPositionSnapshot
-from .market_data import MarketDataPort
+from .market_data import MarketDataPort, QuoteFeedPort
 from .repository import OrderRepositoryPort, PositionRepositoryPort
 
 __all__ = [
@@ -29,4 +29,5 @@ __all__ = [
     "MarketDataPort",
     "OrderRepositoryPort",
     "PositionRepositoryPort",
+    "QuoteFeedPort",
 ]
