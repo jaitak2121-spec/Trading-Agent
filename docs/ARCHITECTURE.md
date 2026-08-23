@@ -92,7 +92,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (3 880 statements)
+### `trading.core` — the safety kernel (3 895 statements)
 
 | Module | What it owns |
 |---|---|
@@ -153,10 +153,16 @@ freeze, go dark, deliver ticks out of order, or stamp them in the future. The
 failure modes that matter are the ones that are hard to reach against a real
 venue.
 
-### `trading.strategy` — proposals only (109 statements)
+### `trading.strategy` — proposals only (666 statements)
 
-`Strategy`, `StrategyRunner`, `MarketView`. A strategy's entire output is a list
-of `OrderIntent`. See §6.
+`Strategy`, `StrategyRunner`, `MarketView` — Stage 1's form, whose entire output
+is a list of `OrderIntent`. Stage 2 adds a parallel form: `SignalStrategy` and
+`SignalRunner` produce `Signal` objects that carry direction, stop, target, and a
+required rationale but **no quantity**, because sizing depends on equity and stop
+distance and is a risk decision rather than a strategy one. `MarketContext`
+widens what a strategy may see to the timestamped market and filters it on the
+way out; `indicators.py` holds pure `Decimal` functions over closed bars. Neither
+runner holds a gateway. See §6.
 
 ---
 
@@ -267,6 +273,18 @@ needs. Recording after the fact would lose the only case that matters.
 state cannot be determined reports ENGAGED. A missing mark price is a risk
 violation, not a skipped check. "I don't know" never resolves to "carry on".
 
+**A signal carries no quantity.** *(Stage 2.)* `Signal` names a direction, a
+stop, a target, and a rationale, and there is nowhere on it to put a size.
+Sizing depends on account equity and the distance to the stop, neither of which a
+strategy should be reasoning about — a strategy that sizes its own orders can
+breach a limit before the risk engine ever sees it. `SignalStrategy` therefore
+rejects sizing-shaped attribute names (`size`, `position_size`, `quantity_for`,
+`size_order`) at class-definition time, alongside the execution-shaped ones. The
+coherence rules are part of the same reasoning: a long whose stop sits at or
+above its reference price is refused at construction, because a zero or negative
+risk-per-unit would make the sizer's division produce an unbounded position from
+a plausible-looking number.
+
 **No retries.** A retry after an uncertain outcome is the single most dangerous
 thing a trading system can do, so there is no retry anywhere in `gateway.py`.
 An uncertain answer produces `UNKNOWN` and stops the system.
@@ -282,7 +300,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 044 tests, ~3 s, 95.6% statement coverage (4 415 statements, 196 missed).
+1 155 tests, ~4 s, 95.9% statement coverage (4 987 statements, 203 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -292,13 +310,15 @@ python3 -m unittest discover -s tests -t .
 | `test_dedupe_reconciliation.py` | 75 | Idempotency keys, UNKNOWN, mismatch, staleness |
 | `test_orders.py` | 75 | Order state machine, `OrderStore` |
 | `test_risk.py` | 75 | Every limit, and the reducing-order waiver |
-| `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData` |
+| `test_signals.py` | 69 | Signal coherence, `MarketContext`, `SignalRunner`, the reference strategy |
+| `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed` |
 | `test_money.py` | 57 | Decimal discipline, precision, rounding |
 | `test_strategy.py` | 53 | `Strategy`, `StrategyRunner`, the execution tripwire |
 | `test_config.py` | 46 | Two-signal live authorization, env and TOML loading |
 | `test_killswitch_breaker.py` | 46 | Latching, asymmetric authority, breaker states |
 | `test_audit.py` | 43 | Hash chain, redaction, identifier survival |
 | `test_core_purity.py` | 43 | The layering rules in §4 |
+| `test_indicators.py` | 42 | Insufficient-data `None`, gap-aware true range, input validation |
 | `test_sizing.py` | 42 | Round-down, verify-the-result |
 | `test_secrets.py` | 37 | Containment and scrubbing |
 | `test_authz.py` | 34 | Role matrix, token single-use and TTL |
@@ -331,11 +351,12 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 196 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 203 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`
-and property accessors. Only two statements carry `# pragma: no cover`.
+and property accessors. Four statements carry `# pragma: no cover`; `trace` does
+not honour the pragma, so they are counted as missed here.
 
 `tests/harness.py` builds a fully wired system (`build_rig()`) with a
 `ManualClock`, an `InMemoryAuditSink`, and a `SimulatedBroker`. Prefer it to

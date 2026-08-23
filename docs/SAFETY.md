@@ -350,6 +350,12 @@ requiring an operator to clear each one would turn every hiccup into an outage.
 
 ### What Stage 1 does not defend against at all
 
+- **A signal that reaches a sizer without a stop.** *(Stage 2.)* `Signal` refuses
+  an incoherent stop at construction, so `risk_per_unit` is never zero or
+  negative — but a stop is optional, and a stopless signal returns `None` there.
+  Nothing yet forces the caller to check: the position sizer that must refuse
+  such a signal rather than substitute a default is not built. Until it is,
+  `Signal` guarantees only that a stop it *does* carry is usable.
 - **Anything requiring a process boundary** — see capability isolation above.
 - **Persistence.** No state survives process exit: no orders, no positions, no
   audit trail, no idempotency keys. A restart after an `UNKNOWN` order loses the
@@ -446,8 +452,8 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 044
-   tests in ~3 s. There is no reason to run a subset.
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 155
+   tests in ~4 s. There is no reason to run a subset.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and
 for the seams a later stage attaches to.
