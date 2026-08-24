@@ -33,6 +33,7 @@ from trading.core.killswitch import KillSwitch
 from trading.core.modes import TradingMode, TradingModeMachine
 from trading.core.money import USD, Money, Price, Quantity
 from trading.core.orders import OrderIntent, OrderSide, OrderStore, OrderType
+from trading.core.portfolio import Portfolio
 from trading.core.reconciliation import PositionLedger, ReconciliationGate
 from trading.core.risk import RiskEngine
 from trading.ports.broker import AckOutcome
@@ -57,6 +58,7 @@ class Rig:
     modes: TradingModeMachine
     orders: OrderStore
     positions: PositionLedger
+    portfolio: Portfolio
     reconciliation: ReconciliationGate
     risk: RiskEngine
     dedupe: IdempotencyRegistry
@@ -160,6 +162,10 @@ def build_rig(
 
     orders = OrderStore()
     positions = PositionLedger()
+    # The portfolio wraps the ledger rather than shadowing it: the gateway writes
+    # fills through the portfolio so a cost basis is recorded, and the
+    # reconciliation gate reads the same quantities out of the ledger.
+    portfolio = Portfolio(Money("1000000.00", USD), ledger=positions)
     reconciliation = ReconciliationGate(
         positions,
         orders,
@@ -202,7 +208,7 @@ def build_rig(
         identity=gateway_id,
         broker=broker,
         orders=orders,
-        positions=positions,
+        positions=portfolio,
         reconciliation=reconciliation,
         risk=risk_engine,
         dedupe=dedupe,
@@ -223,6 +229,7 @@ def build_rig(
         modes=modes,
         orders=orders,
         positions=positions,
+        portfolio=portfolio,
         reconciliation=reconciliation,
         risk=risk_engine,
         dedupe=dedupe,

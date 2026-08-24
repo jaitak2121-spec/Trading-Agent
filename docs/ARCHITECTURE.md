@@ -92,7 +92,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (3 895 statements)
+### `trading.core` — the safety kernel (4 161 statements)
 
 | Module | What it owns |
 |---|---|
@@ -109,6 +109,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 | `orders.py` | `OrderIntent`, `Order`, the order state machine, `OrderStore`. |
 | `dedupe.py` | `IdempotencyRegistry` — a state machine over keys, not orders. |
 | `reconciliation.py` | `PositionLedger` and the `ReconciliationGate` (UNKNOWN + mismatch + staleness). |
+| `portfolio.py` | **Stage 2.** `Portfolio`, `Position`, `FillEffect` — cash, cost basis, realized/unrealized P&L, and equity, layered over one `PositionLedger`. An unknown basis reports as unknown. |
 | `risk.py` | `RiskEngine` and `RiskApproval`. Approvals are single-use capabilities. |
 | `sizing.py` | `PositionSizer`. Rounds down, always; verifies the result rather than trusting the arithmetic. |
 | `gateway.py` | **`ExecutionGateway` — the one place an order can leave this system.** |
@@ -285,6 +286,25 @@ above its reference price is refused at construction, because a zero or negative
 risk-per-unit would make the sizer's division produce an unbounded position from
 a plausible-looking number.
 
+**An unknown cost basis is unknown, not zero.** *(Stage 2.)* `Portfolio` layers
+cash and cost basis over one `PositionLedger` rather than keeping a second
+quantity book, because two local views of a position disagreeing is the failure
+INVARIANT 6 exists to catch and there is no reason to inflict it on ourselves.
+When positions are adopted from a venue we learn the quantity and not what was
+paid, so `Position.average_entry_price` is `None` and `unrealized_pnl` returns
+`None` — reporting zero would price an adopted long as pure profit, which is the
+most expensive lie available to tell a loss limit. The basis also
+*self-invalidates*: the portfolio remembers which quantity its basis describes, so
+any direct ledger write (`set_position`, `adopt_broker_positions`, a future
+persistence adapter) leaves the two disagreeing and the basis reads as unknown,
+without the writer needing to know the portfolio exists. `equity()` still answers
+in that state, because valuation needs a mark and not a basis — but it raises
+rather than skipping a symbol it cannot mark, for the same reason
+`RiskLimit.MARK_PRICE_AVAILABLE` treats a missing mark as a breach. Every
+rounding decision in the module is pessimistic: a buy's cash outflow rounds up, a
+sale's inflow rounds down, a long's market value rounds down, a short's rounds up,
+and a P&L figure rounds toward a loss.
+
 **No retries.** A retry after an uncertain outcome is the single most dangerous
 thing a trading system can do, so there is no retry anywhere in `gateway.py`.
 An uncertain answer produces `UNKNOWN` and stops the system.
@@ -300,7 +320,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 155 tests, ~4 s, 95.9% statement coverage (4 987 statements, 203 missed).
+1 212 tests, ~4 s, 96.1% statement coverage (5 253 statements, 203 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -313,6 +333,7 @@ python3 -m unittest discover -s tests -t .
 | `test_signals.py` | 69 | Signal coherence, `MarketContext`, `SignalRunner`, the reference strategy |
 | `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed` |
 | `test_money.py` | 57 | Decimal discipline, precision, rounding |
+| `test_portfolio.py` | 57 | Cost basis, realized/unrealized P&L, equity refusal, basis self-invalidation |
 | `test_strategy.py` | 53 | `Strategy`, `StrategyRunner`, the execution tripwire |
 | `test_config.py` | 46 | Two-signal live authorization, env and TOML loading |
 | `test_killswitch_breaker.py` | 46 | Latching, asymmetric authority, breaker states |
@@ -370,7 +391,7 @@ Every seam is already named. Nothing in `trading.core` changes.
 
 | Addition | Attaches at | Notes |
 |---|---|---|
-| PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. |
+| PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. |
 | CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `SimulatedBroker` is the reference. |
 | Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. |

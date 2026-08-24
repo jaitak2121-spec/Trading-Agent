@@ -356,13 +356,26 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   Nothing yet forces the caller to check: the position sizer that must refuse
   such a signal rather than substitute a default is not built. Until it is,
   `Signal` guarantees only that a stop it *does* carry is usable.
+- **A realized loss reaching the daily-loss limit.** *(Stage 2.)* `RiskEngine`'s
+  `MAX_DAILY_LOSS` check reads `PnlLedger.realized_loss`, and `Portfolio` now
+  computes a realized figure for every fill and hands it back on `FillEffect` —
+  but nothing wires the second into the first yet, so in production the ledger
+  stays at zero and that limit cannot currently fire. Until the risk integration
+  lands, treat `MAX_DAILY_LOSS` as unproven and rely on the exposure and
+  order-size limits, which do have live inputs.
+- **A cost basis for positions we did not fill ourselves.** *(Stage 2.)* Anything
+  adopted from a venue snapshot, or read back from a future persistence adapter,
+  has no basis and `Portfolio` reports it as unknown rather than guessing. That
+  is the safe direction, but it means P&L attribution is silently unavailable for
+  those positions — `Position.basis_is_known` is the flag to check before
+  believing a P&L number. Equity is unaffected, since it needs marks, not basis.
 - **Anything requiring a process boundary** — see capability isolation above.
 - **Persistence.** No state survives process exit: no orders, no positions, no
   audit trail, no idempotency keys. A restart after an `UNKNOWN` order loses the
   block that `UNKNOWN` was providing. This is the single largest gap, and it is
   why `OrderRepositoryPort` and `PositionRepositoryPort` exist as seams.
 - **Concurrency across processes.** Within one process every mutable control
-  holds a `threading.Lock` (thirteen of the seventeen core modules; the other
+  holds a `threading.Lock` (fourteen of the eighteen core modules; the other
   four — `config`, `errors`, `money`, `sizing` — are immutable value types, the
   exception hierarchy, and a pure calculator). Two processes sharing a venue
   account would each believe they hold the only lock.
