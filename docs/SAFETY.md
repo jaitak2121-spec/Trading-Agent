@@ -350,12 +350,17 @@ requiring an operator to clear each one would turn every hiccup into an outage.
 
 ### What Stage 1 does not defend against at all
 
-- **A signal that reaches a sizer without a stop.** *(Stage 2.)* `Signal` refuses
-  an incoherent stop at construction, so `risk_per_unit` is never zero or
-  negative — but a stop is optional, and a stopless signal returns `None` there.
-  Nothing yet forces the caller to check: the position sizer that must refuse
-  such a signal rather than substitute a default is not built. Until it is,
-  `Signal` guarantees only that a stop it *does* carry is usable.
+- **A sized position reaching an order without passing the gateway.**
+  *(Stage 2, the stopless-signal gap now closed.)* `SignalSizer` is built and
+  refuses a signal with no stop rather than substituting a default, so
+  `Signal`'s optional stop can no longer become an invented one; it also refuses
+  when the day's remaining loss budget is unknowable, rather than reading that
+  as unlimited. What a `SizingResult` is *not* is permission: it is a proposal,
+  and `RiskEngine.approve` still re-checks every limit against the intent that
+  results. A caller that ignores `is_tradeable` gets a zero quantity, which
+  `OrderIntent` rejects outright — but nothing prevents a caller from
+  constructing an intent with a size it made up instead of one the sizer
+  returned. The gateway is what makes that safe, not the sizer.
 - **A daily-loss total that is complete.** *(Stage 2, partly closed.)* Every fill
   the gateway books now records the portfolio's realized figure into `PnlLedger`,
   so `MAX_DAILY_LOSS` fires on a real losing day — both for fills we watched and

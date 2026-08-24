@@ -330,6 +330,35 @@ class PnlLedger:
             return Money.zero(self._currency)
         return -current
 
+    def remaining_budget(self, limit: Money) -> Money | None:
+        """Unspent loss allowance against ``limit``, or ``None`` if unknowable.
+
+        ``None`` means today's total is incomplete: some fill closed against a
+        cost basis we never saw, so :attr:`realized_loss` is a lower bound and a
+        remainder computed from it would be an *upper* bound. That is the
+        direction that sizes a position too large, so the absence is reported
+        rather than papered over -- a caller must refuse, not read it as room.
+
+        Computed under the ledger's own lock, because completeness and the total
+        have to be read as one fact. Sampled separately, a fill landing between
+        the two reads would produce a budget derived from a fresher total than
+        the completeness check that vouched for it.
+        """
+        if not isinstance(limit, Money):
+            raise TypeError("limit must be a Money")
+        if limit.currency != self._currency:
+            raise ValueError(
+                f"limit must be in {self._currency.code}, got {limit.currency.code}"
+            )
+        with self._lock:
+            self._maybe_roll_over()
+            if self._unattributed:
+                return None
+            spent = self.realized_loss
+            if spent >= limit:
+                return Money.zero(self._currency)
+            return limit - spent
+
 
 class RiskEngine:
     """Evaluates an intent against every configured limit.
@@ -381,6 +410,17 @@ class RiskEngine:
     @property
     def pnl(self) -> PnlLedger:
         return self._pnl
+
+    @property
+    def remaining_loss_budget(self) -> Money | None:
+        """Today's unspent daily-loss allowance, or ``None`` if it cannot be stated.
+
+        The one definition of the day's remaining room, so a sizer proposing
+        against it and :meth:`approve` enforcing it are reading the same number
+        from the same ledger. ``None`` when the ledger is incomplete -- see
+        :meth:`PnlLedger.remaining_budget`.
+        """
+        return self._pnl.remaining_budget(self._config.max_daily_loss)
 
     # -- rate accounting ---------------------------------------------------
     def record_submission(self) -> None:

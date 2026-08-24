@@ -92,7 +92,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (4 198 statements)
+### `trading.core` — the safety kernel (4 215 statements)
 
 | Module | What it owns |
 |---|---|
@@ -154,7 +154,7 @@ freeze, go dark, deliver ticks out of order, or stamp them in the future. The
 failure modes that matter are the ones that are hard to reach against a real
 venue.
 
-### `trading.strategy` — proposals only (666 statements)
+### `trading.strategy` — proposals only (737 statements)
 
 `Strategy`, `StrategyRunner`, `MarketView` — Stage 1's form, whose entire output
 is a list of `OrderIntent`. Stage 2 adds a parallel form: `SignalStrategy` and
@@ -162,8 +162,10 @@ is a list of `OrderIntent`. Stage 2 adds a parallel form: `SignalStrategy` and
 required rationale but **no quantity**, because sizing depends on equity and stop
 distance and is a risk decision rather than a strategy one. `MarketContext`
 widens what a strategy may see to the timestamped market and filters it on the
-way out; `indicators.py` holds pure `Decimal` functions over closed bars. Neither
-runner holds a gateway. See §6.
+way out; `indicators.py` holds pure `Decimal` functions over closed bars.
+`SignalSizer` is the join that gives a signal the quantity it withholds — it
+lives here, not in the kernel, only because the kernel may not import a `Signal`,
+and it decides nothing about permission. Neither runner holds a gateway. See §6.
 
 ---
 
@@ -331,6 +333,29 @@ total as the lower bound it actually is. De-risking is still waived through, on
 the same reasoning as a spent budget: a limit must never trap an operator in a
 position, least of all one we cannot value.
 
+**Two `None`s that mean opposite things, kept apart.** *(Stage 2.)*
+`PositionSizer.size_for_stop` reads `remaining_loss_budget=None` as *no budget
+cap*, which is right for a caller with no ledger to consult.
+`RiskEngine.remaining_loss_budget` returns `None` for *the allowance cannot be
+stated* — the day's realized loss is a lower bound because some fill closed
+against an unknown basis. Forwarding the second into the first would convert an
+unknown budget into an unlimited one and produce the largest position the system
+can compute from the least information it can have; measured, that is the full
+risk-fraction size instead of nothing. `SignalSizer` exists partly to keep those
+two apart: it reads the budget itself and refuses an unknown one. The budget is
+derived once, in `PnlLedger.remaining_budget`, under the ledger's own lock —
+completeness and the total have to be sampled as one fact, or a fill landing
+between the two reads yields a budget vouched for by a stale check.
+
+The same module refuses a signal carrying no stop, because a risk-based size
+divides by the distance to the stop and a default stop would invent the number
+the size is derived from. Both refusals return a non-tradeable `SizingResult`
+rather than raising: declining to *open* is always safe, a batch of signals stays
+sizeable, and each declined one carries a machine-readable constraint. An `EXIT`
+signal raises instead — declining to *close* is not safe, and a zero there would
+read as "nothing to do" while the position stayed open. That asymmetry is the
+same one behind the risk engine's de-risking waiver.
+
 **No retries.** A retry after an uncertain outcome is the single most dangerous
 thing a trading system can do, so there is no retry anywhere in `gateway.py`.
 An uncertain answer produces `UNKNOWN` and stops the system.
@@ -346,7 +371,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 244 tests, ~3 s, 96.2% statement coverage (5 290 statements, 202 missed).
+1 276 tests, ~3 s, 96.3% statement coverage (5 378 statements, 201 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -356,6 +381,7 @@ python3 -m unittest discover -s tests -t .
 | `test_dedupe_reconciliation.py` | 75 | Idempotency keys, UNKNOWN, mismatch, staleness |
 | `test_orders.py` | 75 | Order state machine, `OrderStore` |
 | `test_risk.py` | 75 | Every limit, and the reducing-order waiver |
+| `test_signal_sizing.py` | 32 | A stopless signal refused, an unknowable loss budget refused, direction-to-side |
 | `test_signals.py` | 69 | Signal coherence, `MarketContext`, `SignalRunner`, the reference strategy |
 | `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed` |
 | `test_money.py` | 57 | Decimal discipline, precision, rounding |
@@ -399,7 +425,7 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 202 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 201 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`

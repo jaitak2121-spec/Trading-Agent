@@ -65,6 +65,7 @@ class SizingConstraint(Enum):
     EQUITY_CAP = "available_equity"
     LOSS_BUDGET_CAP = "remaining_loss_budget"
     LOT_STEP = "lot_step"
+    MISSING_STOP = "missing_stop"
     NOT_TRADEABLE = "not_tradeable"
 
 
