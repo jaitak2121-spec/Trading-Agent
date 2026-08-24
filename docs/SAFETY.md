@@ -356,13 +356,18 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   Nothing yet forces the caller to check: the position sizer that must refuse
   such a signal rather than substitute a default is not built. Until it is,
   `Signal` guarantees only that a stop it *does* carry is usable.
-- **A realized loss reaching the daily-loss limit.** *(Stage 2.)* `RiskEngine`'s
-  `MAX_DAILY_LOSS` check reads `PnlLedger.realized_loss`, and `Portfolio` now
-  computes a realized figure for every fill and hands it back on `FillEffect` —
-  but nothing wires the second into the first yet, so in production the ledger
-  stays at zero and that limit cannot currently fire. Until the risk integration
-  lands, treat `MAX_DAILY_LOSS` as unproven and rely on the exposure and
-  order-size limits, which do have live inputs.
+- **A daily-loss total that is complete.** *(Stage 2, partly closed.)* Every fill
+  the gateway books now records the portfolio's realized figure into `PnlLedger`,
+  so `MAX_DAILY_LOSS` fires on a real losing day — both for fills we watched and
+  for fills discovered by `resolve_unknown`. What is *not* guaranteed is that the
+  total is the whole loss: a fill that closes against an unknown cost basis (see
+  the next bullet) realizes an amount that cannot be computed, and zero would be
+  a lie. Such a fill is recorded as unattributed, and the limit then **refuses
+  every opening order for the rest of the day** rather than checking the budget
+  against an understated loss. De-risking is still permitted, on the same
+  reasoning as a spent budget. The operational consequence is real: one adopted
+  position closed at midday stops new entries until the UTC rollover, and the
+  only fix is a persisted basis, not a looser check.
 - **A cost basis for positions we did not fill ourselves.** *(Stage 2.)* Anything
   adopted from a venue snapshot, or read back from a future persistence adapter,
   has no basis and `Portfolio` reports it as unknown rather than guessing. That

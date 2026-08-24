@@ -92,7 +92,7 @@ concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (4 161 statements)
+### `trading.core` — the safety kernel (4 198 statements)
 
 | Module | What it owns |
 |---|---|
@@ -305,6 +305,32 @@ rounding decision in the module is pessimistic: a buy's cash outflow rounds up, 
 sale's inflow rounds down, a long's market value rounds down, a short's rounds up,
 and a P&L figure rounds toward a loss.
 
+**One derivation of realized P&L, and one place it enters the risk engine.**
+*(Stage 2.)* `MAX_DAILY_LOSS` reads `PnlLedger`, and the only production writer to
+that ledger is `ExecutionGateway._record_fill`, which both fill sites — the
+ordinary `_settle` path and the `resolve_unknown` recovery path — funnel through,
+so a loss discovered during reconciliation counts exactly as much as one we
+watched happen. `_record_fill` takes the figure straight off `FillEffect` rather
+than recomputing it from price and basis: the basis lives in the portfolio, and a
+second derivation would be a second answer to the same question with its own way
+of being wrong. The wiring errors that would otherwise surface mid-fill are moved
+to construction instead — `ExecutionGateway.__init__` rejects a bare
+`PositionLedger` (which would silently drop every fill price) and a portfolio
+whose currency differs from the risk config (which would raise from `record()`
+*after* the fill had already moved positions and cash).
+
+The subtle case is a fill that *closes* against an unknown basis. It realizes an
+amount that cannot be computed, and recording zero would leave the loss budget
+looking intact after a loss of unknown size — the precise silent understatement
+INVARIANT 7 exists to prevent. So `FillEffect.realized_is_known` distinguishes
+that from a fill that merely *adds* to an unknown-basis position, which realizes
+genuinely nothing and whose zero is a real zero. An unknown one is recorded via
+`PnlLedger.record(..., attributed=False)`, `is_complete` goes false for the rest
+of the UTC day, and the limit breaches on any opening order — treating the day's
+total as the lower bound it actually is. De-risking is still waived through, on
+the same reasoning as a spent budget: a limit must never trap an operator in a
+position, least of all one we cannot value.
+
 **No retries.** A retry after an uncertain outcome is the single most dangerous
 thing a trading system can do, so there is no retry anywhere in `gateway.py`.
 An uncertain answer produces `UNKNOWN` and stops the system.
@@ -320,7 +346,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 212 tests, ~4 s, 96.1% statement coverage (5 253 statements, 203 missed).
+1 244 tests, ~3 s, 96.2% statement coverage (5 290 statements, 202 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -334,6 +360,7 @@ python3 -m unittest discover -s tests -t .
 | `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed` |
 | `test_money.py` | 57 | Decimal discipline, precision, rounding |
 | `test_portfolio.py` | 57 | Cost basis, realized/unrealized P&L, equity refusal, basis self-invalidation |
+| `test_daily_loss.py` | 32 | Realized P&L reaching `MAX_DAILY_LOSS`, and an uncomputable amount refusing rather than reading as zero |
 | `test_strategy.py` | 53 | `Strategy`, `StrategyRunner`, the execution tripwire |
 | `test_config.py` | 46 | Two-signal live authorization, env and TOML loading |
 | `test_killswitch_breaker.py` | 46 | Latching, asymmetric authority, breaker states |
@@ -372,7 +399,7 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 203 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 202 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`

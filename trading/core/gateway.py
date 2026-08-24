@@ -244,6 +244,15 @@ class ExecutionGateway:
             # price, leaving every position we filled ourselves with no cost
             # basis. Caught here rather than at the first fill.
             raise TypeError("positions must be a Portfolio")
+        if positions.base_currency != risk.config.base_currency:
+            # Otherwise recording a fill's realized result would raise *after*
+            # the fill had already been applied, which is the worst possible
+            # moment to discover a wiring error.
+            raise SafetyViolation(
+                f"the portfolio is denominated in {positions.base_currency.code} but "
+                f"the risk config is in {risk.config.base_currency.code}; realized "
+                "profit and loss could not reach the daily-loss limit"
+            )
 
         self._identity = identity
         self._broker = broker
@@ -467,9 +476,7 @@ class ExecutionGateway:
         if ack.outcome is AckOutcome.FILLED:
             assert ack.filled_quantity is not None and ack.fill_price is not None
             order.apply_fill(ack.filled_quantity, ack.fill_price, reason="venue fill")
-            self._positions.apply_fill(
-                order.symbol, order.side, ack.filled_quantity, ack.fill_price
-            )
+            self._record_fill(order, ack)
         else:
             order.transition_to(
                 OrderState.ACCEPTED, reason=ack.message or "accepted by venue"
@@ -482,6 +489,26 @@ class ExecutionGateway:
         return ExecutionResult(
             outcome=ExecutionOutcome.EXECUTED, order=order, ack=ack
         )
+
+    def _record_fill(self, order: Order, ack: BrokerAck) -> None:
+        """Book a fill into the portfolio and its realized result into the risk ledger.
+
+        Both fill sites go through here so the daily-loss limit cannot see one
+        kind of fill and miss the other -- a fill discovered during recovery is
+        as real as one we watched happen.
+
+        The realized figure is the portfolio's, not a second derivation: the
+        cost basis lives there, and recomputing it here would be a second
+        answer to the same question with its own way of being wrong.
+        """
+        assert ack.filled_quantity is not None and ack.fill_price is not None
+        effect = self._positions.apply_fill(
+            order.symbol, order.side, ack.filled_quantity, ack.fill_price
+        )
+        # A fill that closed against an unknown basis realized something we
+        # cannot name. Recorded as such, so the limit refuses instead of
+        # reading an understated loss (INVARIANT 7).
+        self._risk.pnl.record(effect.realized_pnl, attributed=effect.realized_is_known)
 
     def _to_unknown(
         self, order: Order, *, reason: str, ack: BrokerAck | None
@@ -632,9 +659,7 @@ class ExecutionGateway:
                 reason="fill discovered during reconciliation",
                 via_reconciliation=True,
             )
-            self._positions.apply_fill(
-                order.symbol, order.side, ack.filled_quantity, ack.fill_price
-            )
+            self._record_fill(order, ack)
         else:
             order.transition_to(
                 OrderState.ACCEPTED,
