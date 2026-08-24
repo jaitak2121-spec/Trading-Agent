@@ -150,7 +150,7 @@ class TestAuthorizationGate(GatewayFixture):
             identity=identity,
             broker=rig.broker,
             orders=rig.orders,
-            positions=rig.positions,
+            positions=rig.portfolio,
             reconciliation=rig.reconciliation,
             risk=rig.risk,
             dedupe=rig.dedupe,

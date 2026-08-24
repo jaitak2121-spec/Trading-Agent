@@ -80,7 +80,8 @@ from .killswitch import KillSwitch
 from .modes import TradingModeMachine
 from .money import Price
 from .orders import Order, OrderIntent, OrderState, OrderStore
-from .reconciliation import PositionLedger, ReconciliationGate
+from .portfolio import Portfolio
+from .reconciliation import ReconciliationGate
 from .risk import RiskApproval, RiskEngine
 from ..ports.broker import AckOutcome, BrokerAck, BrokerPort
 
@@ -216,7 +217,7 @@ class ExecutionGateway:
         identity: Principal,
         broker: BrokerPort,
         orders: OrderStore,
-        positions: PositionLedger,
+        positions: Portfolio,
         reconciliation: ReconciliationGate,
         risk: RiskEngine,
         dedupe: IdempotencyRegistry,
@@ -238,6 +239,11 @@ class ExecutionGateway:
             )
         if not isinstance(broker, BrokerPort):
             raise TypeError("broker must implement BrokerPort")
+        if not isinstance(positions, Portfolio):
+            # A bare PositionLedger would accept the quantity and drop the fill
+            # price, leaving every position we filled ourselves with no cost
+            # basis. Caught here rather than at the first fill.
+            raise TypeError("positions must be a Portfolio")
 
         self._identity = identity
         self._broker = broker
@@ -461,7 +467,9 @@ class ExecutionGateway:
         if ack.outcome is AckOutcome.FILLED:
             assert ack.filled_quantity is not None and ack.fill_price is not None
             order.apply_fill(ack.filled_quantity, ack.fill_price, reason="venue fill")
-            self._positions.apply_fill(order.symbol, order.side, ack.filled_quantity)
+            self._positions.apply_fill(
+                order.symbol, order.side, ack.filled_quantity, ack.fill_price
+            )
         else:
             order.transition_to(
                 OrderState.ACCEPTED, reason=ack.message or "accepted by venue"
@@ -624,7 +632,9 @@ class ExecutionGateway:
                 reason="fill discovered during reconciliation",
                 via_reconciliation=True,
             )
-            self._positions.apply_fill(order.symbol, order.side, ack.filled_quantity)
+            self._positions.apply_fill(
+                order.symbol, order.side, ack.filled_quantity, ack.fill_price
+            )
         else:
             order.transition_to(
                 OrderState.ACCEPTED,

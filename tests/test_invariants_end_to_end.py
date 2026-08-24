@@ -308,7 +308,7 @@ class TestInvariant4RiskPrecedesExecution(SystemCase):
                 identity=omnipotent,
                 broker=self.rig.broker,
                 orders=self.rig.orders,
-                positions=self.rig.positions,
+                positions=self.rig.portfolio,
                 reconciliation=self.rig.reconciliation,
                 risk=self.rig.risk,
                 dedupe=self.rig.dedupe,
