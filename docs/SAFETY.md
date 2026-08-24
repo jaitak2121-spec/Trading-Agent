@@ -23,7 +23,7 @@ everything relevant to a limit breach.
 |---:|---|---|---|
 | 1 | `LIVE_TRADING` defaults to FALSE | `config.py`, `modes.py` | `test_config.py`, `TestInvariant1LiveIsOptIn` |
 | 2 | No order executes while live trading is disabled | `modes.py`, `gateway.py` | `test_modes.py`, `TestInvariant2NoLiveWithoutAuthorization` |
-| 3 | Strategy code cannot directly execute an order | `authz.py`, `ports/broker.py`, `strategy/base.py`, `gateway.py` | `test_authz.py`, `test_strategy.py`, `TestInvariant3StrategyCannotExecute` |
+| 3 | Strategy code cannot directly execute an order | `authz.py`, `ports/broker.py`, `strategy/base.py`, `advisory/advisor.py`, `gateway.py` | `test_authz.py`, `test_strategy.py`, `test_advisory.py`, `TestInvariant3StrategyCannotExecute` |
 | 4 | Risk checks happen before execution | `risk.py`, `gateway.py` | `test_risk.py`, `TestInvariant4RiskPrecedesExecution` |
 | 5 | An UNKNOWN order blocks new orders until reconciled | `reconciliation.py`, `orders.py` | `test_dedupe_reconciliation.py`, `TestInvariant5UnknownBlocks` |
 | 6 | A local/venue position mismatch blocks new live orders | `reconciliation.py` | `test_dedupe_reconciliation.py`, `TestInvariant6MismatchBlocks` |
@@ -89,6 +89,52 @@ deliberately not released: we cannot prove the venue never saw it.
 outcome is the single most dangerous thing a trading system can do — it is how
 you end up long twice. An uncertain answer stops the system and waits for a
 human.
+
+### Advisory mode: the half with no chain
+
+Advisory mode analyses, sizes, and explains. It never submits, and that is
+structural rather than a UI convention. Four independent things would each have
+to be undone for advisory output to reach a venue:
+
+1. **The import graph.** `trading.advisory` may not import
+   `trading.core.gateway` or `trading.ports.broker`. There is no gateway to call
+   and no broker to hold. `test_core_purity.py` parses the AST of every module in
+   the layer and also asserts nothing in `trading/` imports the layer back, so a
+   later module cannot quietly route execution through it.
+2. **The identity.** `Advisor` requires a principal holding `PROPOSE_ORDER` and
+   refuses one holding `EXECUTE_ORDER`. Only `Role.EXECUTION_GATEWAY` holds the
+   latter, and it does not hold the former, so advisory mode cannot be run as the
+   only identity that could act on its output.
+3. **The constructor tripwire.** `refuse_execution_surface` runs over the
+   advisor's own attributes, so a `BrokerPort` or `ExecutionToken` passed in by
+   mistake is rejected at construction rather than discovered in production.
+4. **The output type.** An `Advice` holds no `OrderIntent`. Advisory output is not
+   the shape `ExecutionGateway.submit` accepts, so it cannot be forwarded — an
+   intent has to be deliberately built by code outside this layer, which is a
+   reviewable change rather than a plumbing accident.
+
+**Advice is not permission.** The advisor never calls `RiskEngine.approve`, so no
+`RiskApproval` exists anywhere that an actual execution attempt did not create.
+An `Advice` that says `is_actionable` means "there is something here to do", not
+"this is allowed": every limit is re-checked against the intent that eventually
+results, and any of the ten gates above may still refuse it. Each advice is
+audited under `AuditCategory.ADVICE` with outcome `INFO` — never `ALLOWED`, which
+would read as an approval — so what an operator was shown can be reconstructed
+if they acted on it.
+
+Two refusals are advisory mode's own, and neither duplicates a kernel check.
+A signal whose **stop the market has already reached** is blocked, because sizing
+it produces a "risking 500 USD" figure that is a fiction — the loss is incurred at
+entry. A signal whose **target the market has already reached** is only warned
+about: the reward is gone but the stop still bounds the loss and the size is still
+real, so refusing would be a judgement about trade quality rather than a safety
+matter. Everything else advisory mode declines on — no stop, an unknowable loss
+budget, an exhausted one — is `SignalSizer`'s refusal passed through verbatim.
+
+**A blocked advice carries no size.** `Advice.__post_init__` raises
+`SafetyViolation` on a refusal that still reports a quantity, and on a quantity
+that differs from the sizer's, because the number an operator reads must be the
+number the limits were applied to.
 
 ---
 
@@ -361,6 +407,17 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   `OrderIntent` rejects outright — but nothing prevents a caller from
   constructing an intent with a size it made up instead of one the sizer
   returned. The gateway is what makes that safe, not the sizer.
+- **An operator who acts on advice by hand.** *(Stage 2, and not fixable here.)*
+  Advisory mode cannot execute — four independent mechanisms see to that (§2) —
+  but nothing stops a human from reading an `Advice` and typing the order into a
+  broker's own web terminal. Such a position exists in the account and not in this
+  system: it consumes no exposure budget, contributes nothing to the daily-loss
+  total, and appears to `ReconciliationGate` as a venue-side mismatch that blocks
+  new live orders until it is adopted. That last part is the safe direction and is
+  the only defence available. Treat advisory output as analysis to review, not as
+  a work queue to key in; if positions are going to be opened by hand, adopt them
+  into the portfolio afterwards, and read the cost-basis caveat below before
+  trusting any P&L figure that includes them.
 - **A daily-loss total that is complete.** *(Stage 2, partly closed.)* Every fill
   the gateway books now records the portfolio's realized figure into `PnlLedger`,
   so `MAX_DAILY_LOSS` fires on a real losing day — both for fills we watched and

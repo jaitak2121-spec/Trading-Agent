@@ -6,6 +6,8 @@ Three docstrings in this repository promise something about imports:
 * :mod:`trading.ports` -- stdlib and :mod:`trading.core` only; no infrastructure.
 * :mod:`trading.adapters` -- no network I/O anywhere, and nothing in the kernel
   may import back into it.
+* :mod:`trading.advisory` -- no way to execute: neither the gateway nor a broker
+  port, and no caller anywhere, since it is a leaf.
 
 A comment claiming that is worth nothing. This module reads every source file in
 the package with :mod:`ast`, resolves every import to an absolute dotted name,
@@ -41,6 +43,7 @@ CORE = "trading.core"
 PORTS = "trading.ports"
 ADAPTERS = "trading.adapters"
 STRATEGY = "trading.strategy"
+ADVISORY = "trading.advisory"
 
 #: What each layer may import from inside the package.
 KERNEL_LAYERS = (CORE, PORTS)
@@ -56,7 +59,21 @@ LAYER_RULES: dict[str, frozenset[str]] = {
     # Strategies see core values and the port types they are handed. They may
     # not import a concrete adapter, which is how INVARIANT 3 stays structural.
     STRATEGY: frozenset({CORE, PORTS, STRATEGY}),
+    # Advisory mode reads signals, sizes them, and explains. It needs core value
+    # types and the strategy layer's Signal, and no adapter: a layer that cannot
+    # reach a concrete broker cannot contact one. The narrower prohibition that
+    # matters -- no gateway, no broker port -- cannot be expressed as a layer
+    # rule, because both live in layers advisory legitimately depends on. See
+    # TestAdvisoryCannotExecute.
+    ADVISORY: frozenset({CORE, PORTS, STRATEGY, ADVISORY}),
 }
+
+#: The two modules that would give advisory mode a way to execute. Named
+#: individually because a layer rule cannot separate them from the rest of their
+#: layers, and this is the separation the advisory layer exists to hold.
+EXECUTION_MODULES: frozenset[str] = frozenset(
+    {"trading.core.gateway", "trading.ports.broker"}
+)
 
 #: Modules that would put real infrastructure inside a Stage 1 file. Some are
 #: stdlib and therefore invisible to a third-party check, which is exactly why
@@ -421,6 +438,62 @@ class TestStrategyLayerCannotReachAVenue(PurityCase):
                     )
 
 
+class TestAdvisoryCannotExecute(PurityCase):
+    """The advisory layer's whole reason for existing, checked mechanically.
+
+    Advisory mode is allowed to see everything the strategy layer sees and to use
+    the kernel's value types and risk machinery. What it may not do is reach
+    execution -- and that prohibition cannot be a layer rule, because
+    ``ExecutionGateway`` lives in ``trading.core`` and ``BrokerPort`` in
+    ``trading.ports``, both layers advisory legitimately depends on. So the two
+    modules are named individually. Without this test, "advisory mode never
+    places an order" would be a docstring.
+    """
+
+    def test_advisory_imports_only_stdlib_core_ports_and_strategy(self) -> None:
+        for path in files_in(ADVISORY):
+            for imported in imports_of(path):
+                with self.subTest(path=path.name, imported=imported):
+                    self.assertImportAllowed(path, imported, LAYER_RULES[ADVISORY])
+
+    def test_no_advisory_module_imports_the_gateway_or_a_broker(self) -> None:
+        for path in files_in(ADVISORY):
+            for imported in imports_of(path):
+                with self.subTest(path=path.name, imported=imported):
+                    self.assertNotIn(
+                        imported,
+                        EXECUTION_MODULES,
+                        f"{path.name} imports '{imported}'; advisory mode analyses "
+                        "and explains, and must have no way to submit an order",
+                    )
+
+    def test_no_advisory_module_imports_a_concrete_adapter(self) -> None:
+        for path in files_in(ADVISORY):
+            for imported in imports_of(path):
+                with self.subTest(path=path.name, imported=imported):
+                    self.assertFalse(
+                        imported.startswith(ADAPTERS),
+                        f"{path.name} imports '{imported}'; a layer that cannot "
+                        "name a venue cannot contact one",
+                    )
+
+    def test_nothing_outside_advisory_imports_advisory(self) -> None:
+        # The arrow points into advisory and never out of it. If the kernel or a
+        # strategy could import an Advisor, advisory mode would stop being a leaf
+        # and its no-execution guarantee would start depending on its callers.
+        for path in SOURCE_FILES:
+            layer = layer_of(module_name_of(path))
+            if layer == ADVISORY:
+                continue
+            for imported in imports_of(path):
+                with self.subTest(path=path.name, imported=imported):
+                    self.assertFalse(
+                        imported == ADVISORY or imported.startswith(ADVISORY + "."),
+                        f"{path.name} imports '{imported}'; advisory mode is a "
+                        "leaf layer and nothing in the platform depends on it",
+                    )
+
+
 class TestNoThirdPartyAnywhere(PurityCase):
     """The Stage 1 constraint: standard library only, no installed packages."""
 
@@ -680,9 +753,13 @@ class TestLayeringIsAcyclic(PurityCase):
         self.assertIn((CORE, PORTS), edges, "the kernel should call out via ports")
         self.assertIn((ADAPTERS, PORTS), edges, "adapters should implement ports")
         self.assertIn((STRATEGY, CORE), edges, "strategies should use core values")
+        self.assertIn((ADVISORY, STRATEGY), edges, "advisory should read signals")
+        self.assertIn((ADVISORY, CORE), edges, "advisory should use core values")
         self.assertNotIn((PORTS, ADAPTERS), edges)
         self.assertNotIn((CORE, ADAPTERS), edges)
         self.assertNotIn((CORE, STRATEGY), edges)
+        self.assertNotIn((CORE, ADVISORY), edges)
+        self.assertNotIn((STRATEGY, ADVISORY), edges)
         self.assertNotIn((PORTS, STRATEGY), edges)
 
     def test_each_kernel_module_imports_cleanly_on_its_own(self) -> None:
