@@ -42,16 +42,19 @@ each enforced in code and asserted in tests. Stdlib `unittest` only,
 
 ## 2. Layers and the dependency arrow
 
-Four layers. The arrow points one way, always inward.
+Five layers. The arrow points one way, always inward.
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │        trading.strategy                 │
-                    │   decides WHAT to trade,                │
-                    │   never WHETHER it may                  │
-                    └──────────────────┬──────────────────────┘
-                                       │ returns inert OrderIntents
-                                       ▼
+   ┌─────────────────────────────┐   ┌─────────────────────────────────────┐
+   │      trading.strategy       │──▶│         trading.advisory            │
+   │   decides WHAT to trade,    │   │   explains, sizes, and warns.       │
+   │   never WHETHER it may      │   │   Imports no gateway, no broker:    │
+   └──────────────┬──────────────┘   │   there is nothing here to execute  │
+                  │                  │   through. A leaf — nothing in      │
+                  │                  │   trading/ imports it back          │
+                  │                  └─────────────────┬───────────────────┘
+                  │ returns inert OrderIntents         │ values only
+                  ▼                                    ▼
    ┌───────────────────────────────────────────────────────────────────┐
    │                        THE PURE KERNEL                            │
    │                                                                   │
@@ -88,11 +91,19 @@ knows which one it got.
 may import `trading.core` and `trading.ports`, but no strategy module imports a
 concrete adapter or the gateway. `test_core_purity.py` checks both directly.
 
+**Advisory mode is a leaf, and its rule is narrower.** `trading.advisory` may
+import the kernel and `trading.strategy` — it reads signals and reuses the sizer
+— but it may not import `trading.core.gateway` or `trading.ports.broker`, and
+nothing else in `trading/` may import *it*. The prohibition names those two
+modules rather than a whole layer because both live in layers advisory
+legitimately depends on; "cannot execute" is therefore checked as two named
+modules, the same way `trading.strategy`'s gateway ban already is.
+
 ---
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (4 215 statements)
+### `trading.core` — the safety kernel (4 216 statements)
 
 | Module | What it owns |
 |---|---|
@@ -167,17 +178,42 @@ way out; `indicators.py` holds pure `Decimal` functions over closed bars.
 lives here, not in the kernel, only because the kernel may not import a `Signal`,
 and it decides nothing about permission. Neither runner holds a gateway. See §6.
 
+### `trading.advisory` — advisory mode (397 statements)
+
+`Advisor` turns a `Signal` plus a `MarketContext` into an `Advice`: a side, a
+size, the cash at risk to the stop, the reasoning, and every reason not to act.
+It is the surface advisory mode is used through, and it is a separate layer
+because the one thing it must not be able to do is execute.
+
+What it adds over `SignalSizer` is the comparison against the market *as it is
+now*. It blocks — with a stated reason, in a `Block` shaped like `LimitBreach` —
+on missing or stale data, a signal from the future or older than an
+operator-chosen limit, a stop the market has already reached, and a size the
+sizer refused to compute. A *reached target* is only a warning: the reward is
+gone but the stop still bounds the loss, so refusing would be a judgement about
+trade quality rather than a safety matter. Position monitoring needed nothing
+new — `Portfolio.open_positions()` is already the list an advisory report shows.
+
+Four guarantees, in descending order of how hard they are to defeat: the import
+rule above; an identity that holds `PROPOSE_ORDER` and not `EXECUTE_ORDER`;
+`refuse_execution_surface` over the advisor's own attributes; and an `Advice` that
+holds no `OrderIntent`, so advisory output is not the shape anything downstream
+submits. The advisor also never calls `RiskEngine.approve`, so no approval exists
+in the system that an execution attempt did not create.
+
 ---
 
 ## 4. What is enforced mechanically
 
-`tests/test_core_purity.py` (43 tests) parses every source file's AST and
+`tests/test_core_purity.py` (47 tests) parses every source file's AST and
 checks the layering rather than trusting review. It asserts, among other things:
 
 - `trading.core` imports only stdlib, `trading.core`, and `trading.ports`
 - `trading.ports` imports only stdlib and `trading.core`
 - no kernel module imports `trading.adapters`, `trading.strategy`, or `tests`
 - no strategy module imports a concrete adapter or the gateway
+- no advisory module imports the gateway, a broker port, or a concrete adapter,
+  and nothing in `trading/` imports `trading.advisory`
 - every import in the package resolves to stdlib or first-party — no third-party
   anywhere, **including the test suite**
 - no dependency manifest declares a requirement
@@ -371,7 +407,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 276 tests, ~3 s, 96.3% statement coverage (5 378 statements, 201 missed).
+1 350 tests, ~3 s, 96.5% statement coverage (5 776 statements, 203 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -381,6 +417,7 @@ python3 -m unittest discover -s tests -t .
 | `test_dedupe_reconciliation.py` | 75 | Idempotency keys, UNKNOWN, mismatch, staleness |
 | `test_orders.py` | 75 | Order state machine, `OrderStore` |
 | `test_risk.py` | 75 | Every limit, and the reducing-order waiver |
+| `test_advisory.py` | 70 | Advice places nothing, blocks vs warnings, a refusal carries no size |
 | `test_signal_sizing.py` | 32 | A stopless signal refused, an unknowable loss budget refused, direction-to-side |
 | `test_signals.py` | 69 | Signal coherence, `MarketContext`, `SignalRunner`, the reference strategy |
 | `test_adapters.py` | 66 | `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed` |
@@ -391,7 +428,7 @@ python3 -m unittest discover -s tests -t .
 | `test_config.py` | 46 | Two-signal live authorization, env and TOML loading |
 | `test_killswitch_breaker.py` | 46 | Latching, asymmetric authority, breaker states |
 | `test_audit.py` | 43 | Hash chain, redaction, identifier survival |
-| `test_core_purity.py` | 43 | The layering rules in §4 |
+| `test_core_purity.py` | 47 | The layering rules in §4 |
 | `test_indicators.py` | 42 | Insufficient-data `None`, gap-aware true range, input validation |
 | `test_sizing.py` | 42 | Round-down, verify-the-result |
 | `test_secrets.py` | 37 | Containment and scrubbing |
@@ -425,11 +462,14 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 201 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 203 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`
-and property accessors. Four statements carry `# pragma: no cover`; `trace` does
+and property accessors. Two are the `Advisor`'s refusal of an identity holding
+`EXECUTE_ORDER`, which no role holds together with `PROPOSE_ORDER` — the test
+asserts *that* property instead, since it is what would have to change for the
+tripwire to matter. Four statements carry `# pragma: no cover`; `trace` does
 not honour the pragma, so they are counted as missed here.
 
 `tests/harness.py` builds a fully wired system (`build_rig()`) with a
@@ -447,7 +487,7 @@ Every seam is already named. Nothing in `trading.core` changes.
 | PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. |
 | CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `SimulatedBroker` is the reference. |
 | Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
-| FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. |
+| FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. An *advisory* endpoint calls `Advisor.advise` instead and needs no gateway at all — the two halves of the API are wired to different layers. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |
 | Real strategies | `trading.strategy` | Subclass `Strategy`; the runner's tripwire applies. |
 

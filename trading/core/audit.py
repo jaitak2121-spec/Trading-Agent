@@ -59,6 +59,10 @@ class AuditCategory(str, Enum):
     AUTH = "auth"
     #: A strategy proposing an intent. Distinct from ORDER: nothing exists yet.
     SIGNAL = "signal"
+    #: Advisory output. Distinct from SIGNAL: a signal is what a strategy decided,
+    #: an advice is what an operator was shown, including the size and the reasons
+    #: not to act. An operator who acted must be reconstructable from this.
+    ADVICE = "advice"
     ORDER = "order"
     RISK = "risk"
     KILL_SWITCH = "kill_switch"
