@@ -17,6 +17,11 @@ The second form is the one to write new strategies against. The first is kept
 because the execution chain's tests are written against it, and replacing a proven
 interface to gain nothing is not an improvement.
 
+:class:`~trading.strategy.sizing.SignalSizer` is where a signal acquires the
+quantity it deliberately lacks. It lives here rather than in the kernel only
+because the kernel may not import a ``Signal``; it decides nothing about
+permission, and refuses to size a signal whose risk is undefined.
+
 Neither form can execute. Both runners refuse a strategy holding a broker, a
 token, or anything exposing ``place_order``, and neither runner holds a gateway --
 strategy code and execution code never appear in the same call stack.
@@ -28,6 +33,7 @@ from .base import MarketView, Strategy, StrategyRunner, refuse_execution_surface
 from .context import MarketContext
 from .examples import MovingAverageCrossover
 from .signals import Signal, SignalDirection, SignalRunner, SignalStrategy
+from .sizing import SignalSizer
 
 __all__ = [
     "MarketContext",
@@ -36,6 +42,7 @@ __all__ = [
     "Signal",
     "SignalDirection",
     "SignalRunner",
+    "SignalSizer",
     "SignalStrategy",
     "Strategy",
     "StrategyRunner",
