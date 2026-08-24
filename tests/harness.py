@@ -36,7 +36,7 @@ from trading.core.orders import OrderIntent, OrderSide, OrderStore, OrderType
 from trading.core.portfolio import Portfolio
 from trading.core.reconciliation import PositionLedger, ReconciliationGate
 from trading.core.risk import RiskEngine
-from trading.ports.broker import AckOutcome
+from trading.ports.broker import AckOutcome, BrokerPort
 
 #: The venue price used throughout. 0.001 BTC = 50 USD, comfortably inside the
 #: default 100 USD per-order ceiling, so a plain order succeeds and a test has to
@@ -65,7 +65,7 @@ class Rig:
     kill_switch: KillSwitch
     breakers: BreakerRegistry
     breaker: CircuitBreaker
-    broker: SimulatedBroker
+    broker: BrokerPort
     market_data: StaticMarketData
     gateway: ExecutionGateway
     strategy_id: Principal
@@ -138,14 +138,22 @@ def build_rig(
     risk: RiskConfig | None = None,
     max_staleness_seconds: float = 300.0,
     token_ttl_seconds: int = 30,
+    clock: ManualClock | None = None,
+    broker: BrokerPort | None = None,
 ) -> Rig:
     """Wire a complete system.
 
     Defaults to PAPER with immediately-filling acks, which is the configuration
     in which a well-formed order is expected to succeed -- so any test that sees
     a refusal knows the refusal came from the gate it was probing.
+
+    ``clock`` and ``broker`` exist for the venues that need building before the
+    rig: a broker with its own quote feed has to share this system's clock, so
+    the caller makes the clock, makes the venue, and hands both in. Passing a
+    ``broker`` makes ``default_outcome`` irrelevant, since that only configures
+    the simulator this would replace.
     """
-    clock = ManualClock()
+    clock = clock or ManualClock()
     sink = InMemoryAuditSink()
     audit = AuditLog(sink, clock=clock)
 
@@ -190,11 +198,12 @@ def build_rig(
     )
 
     market_data = StaticMarketData({SYMBOL: DEFAULT_PRICE})
-    broker = SimulatedBroker(
-        clock=clock,
-        default_outcome=default_outcome,
-        fill_prices={SYMBOL: DEFAULT_PRICE},
-    )
+    if broker is None:
+        broker = SimulatedBroker(
+            clock=clock,
+            default_outcome=default_outcome,
+            fill_prices={SYMBOL: DEFAULT_PRICE},
+        )
 
     modes = TradingModeMachine(config, audit)
     if mode is not TradingMode.DISABLED:

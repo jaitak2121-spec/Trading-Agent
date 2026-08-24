@@ -453,6 +453,18 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   no partial-write handling, and no evidence about how a real venue behaves under
   load. The `UNCERTAIN`-and-raise paths are modelled by `SimulatedBroker`; they
   are not validated against a real exchange.
+- **Paper results are optimistic, structurally.** `PaperBroker` crosses the
+  correct side of the book and can be given `slippage_bps` and a `depth` cap, so
+  it is not the mid-price fantasy that flatters most paper accounts. It still
+  models no latency, no queue position, and no market impact: depth is the size
+  available to one placement, not a pool that thins as you trade it. So a paper
+  fill is an upper bound on a live fill, always, and a strategy whose edge is
+  smaller than the difference will look profitable on paper and lose money live.
+  There is no fee model either — cost has to be expressed through
+  `slippage_bps`, because the fill price is the only number the cost basis and
+  therefore the daily-loss limit read. A separate fee field would be money no
+  risk control could see. This is why a broker sandbox sits between paper and
+  live, and it is not optional.
 - **The venue lying.** Reconciliation compares our ledger against what the broker
   *reports*. A venue reporting incorrect positions produces a mismatch that
   cannot be resolved by asking it again.

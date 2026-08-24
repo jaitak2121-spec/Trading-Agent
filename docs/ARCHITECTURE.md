@@ -156,14 +156,32 @@ not the whole guarantee. `test_ports.py` checks that every abstract method
 exists on each implementation *with a compatible signature* — strictly stronger
 than inheritance, which would notice a missing method but not a changed one.
 
-### `trading.adapters.memory` — the only adapters (287 statements)
+### `trading.adapters` — the only adapters (503 statements)
 
-`SimulatedBroker`, `StaticMarketData`, and (Stage 2) `InMemoryQuoteFeed`.
-Deterministic, offline, clock injected. The broker can be scripted to reject, to
-answer `UNCERTAIN`, or to raise after the request has left; the quote feed can
-freeze, go dark, deliver ticks out of order, or stamp them in the future. The
-failure modes that matter are the ones that are hard to reach against a real
-venue.
+Two subpackages, deliberately opposite, both behind the one gateway.
+
+`trading.adapters.memory` (287 statements) is the **hostile** half:
+`SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed`. The broker can be
+scripted to reject, to answer `UNCERTAIN`, or to raise after the request has left;
+the quote feed can freeze, go dark, deliver ticks out of order, or stamp them in
+the future. The failure modes that matter are the ones that are hard to reach
+against a real venue.
+
+`trading.adapters.paper` (216 statements) is the **honest** half: `PaperBroker`
+fills from the same `QuoteFeedPort` the rest of the system reads, crossing the
+side of the book the order actually crosses (a buy lifts the ask), applying
+`slippage_bps` against the order in both directions, capping each placement at
+the configured `depth` — which is where **partial fills** come from — and
+refusing rather than guessing when the quote is missing or stale. It never
+answers `UNCERTAIN` and never raises, because a venue inside this process is
+never genuinely in doubt; that case belongs to the simulator and stays there.
+There is no `script` and no `raise_on_next`, and no fee field: cost is expressed
+through the fill price, which is the only number the cost basis and therefore the
+daily-loss limit ever read.
+
+A paper fill is still an optimistic estimate of a live one — nothing here models
+latency, queue position, or market impact. That is why the progression runs
+through a broker sandbox rather than from paper straight to live.
 
 ### `trading.strategy` — proposals only (737 statements)
 
@@ -407,10 +425,11 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 350 tests, ~3 s, 96.5% statement coverage (5 776 statements, 203 missed).
+1 462 tests, ~3 s, 96.7% statement coverage (5 992 statements, 199 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
+| `test_paper_broker.py` | 112 | Fills at the crossed side, slippage against the order, partial fills, every refusal, and every gate still refusing with the paper venue behind it |
 | `test_marketdata.py` | 95 | Quote/candle validation, staleness, the frozen-feed refusal |
 | `test_gateway.py` | 89 | Each gate's refusal, and the chain ordering |
 | `test_invariants_end_to_end.py` | 79 | All thirteen invariants on a wired system |
@@ -462,7 +481,7 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 203 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 199 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`
@@ -474,7 +493,9 @@ not honour the pragma, so they are counted as missed here.
 
 `tests/harness.py` builds a fully wired system (`build_rig()`) with a
 `ManualClock`, an `InMemoryAuditSink`, and a `SimulatedBroker`. Prefer it to
-hand-wiring in new tests.
+hand-wiring in new tests. Pass `clock=` and `broker=` to swap in a different
+venue — a `PaperBroker` needs the rig's clock at construction time, since its
+quote feed has to be stamped by the same clock the staleness check reads.
 
 ---
 
@@ -485,7 +506,8 @@ Every seam is already named. Nothing in `trading.core` changes.
 | Addition | Attaches at | Notes |
 |---|---|---|
 | PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. |
-| CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `SimulatedBroker` is the reference. |
+| CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `PaperBroker` is the reference for the shape of an honest ack; `SimulatedBroker` is the reference for the failure modes a real client will actually hit. Unlike either, a network client *can* be genuinely in doubt, so it must answer `UNCERTAIN` rather than guess. |
+| Order lifecycle beyond the ack | `PaperBroker.fetch_order_state` | A non-crossing limit rests and stays resting: there is no path today for a fill discovered outside `place_order` to reach the portfolio except operator `resolve_unknown`. Driving a resting order to a fill is a lifecycle change, and it belongs in core, not in an adapter. |
 | Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. An *advisory* endpoint calls `Advisor.advise` instead and needs no gateway at all — the two halves of the API are wired to different layers. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |
