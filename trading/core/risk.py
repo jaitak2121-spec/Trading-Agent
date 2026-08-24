@@ -249,6 +249,11 @@ class PnlLedger:
     budget*, so it is deliberately driven by the injected clock rather than
     ``datetime.now()`` -- a test must be able to prove the reset happens exactly
     once, at the boundary, and not because a timer drifted.
+
+    The ledger also counts fills whose realized amount could not be computed --
+    a close against a position whose cost basis we never saw. Such a fill is not
+    a zero; it is a hole in today's total, and :attr:`is_complete` reports it so
+    the daily-loss limit can refuse rather than trust an understated figure.
     """
 
     def __init__(self, base_currency, *, clock: Clock) -> None:
@@ -256,6 +261,7 @@ class PnlLedger:
         self._clock = clock
         self._day = clock.now().date()
         self._realized = Money.zero(base_currency)
+        self._unattributed = 0
         self._lock = threading.RLock()
 
     @property
@@ -270,9 +276,17 @@ class PnlLedger:
         if today != self._day:
             self._day = today
             self._realized = Money.zero(self._currency)
+            self._unattributed = 0
 
-    def record(self, pnl: Money) -> Money:
-        """Add a realized result. Negative values are losses."""
+    def record(self, pnl: Money, *, attributed: bool = True) -> Money:
+        """Add a realized result. Negative values are losses.
+
+        ``attributed=False`` says this fill realized an amount we could not
+        compute, so ``pnl`` is a placeholder rather than the answer. It is still
+        added -- it is zero in that case -- but the fill is counted against
+        :attr:`is_complete`, because the alternative is a silent zero making the
+        loss budget look intact when it may not be.
+        """
         if not isinstance(pnl, Money):
             raise TypeError("realized pnl must be a Money")
         if pnl.currency != self._currency:
@@ -282,6 +296,8 @@ class PnlLedger:
         with self._lock:
             self._maybe_roll_over()
             self._realized = self._realized + pnl
+            if not attributed:
+                self._unattributed += 1
             return self._realized
 
     @property
@@ -291,8 +307,24 @@ class PnlLedger:
             return self._realized
 
     @property
+    def unattributed_fills(self) -> int:
+        """Fills today whose realized amount could not be computed."""
+        with self._lock:
+            self._maybe_roll_over()
+            return self._unattributed
+
+    @property
+    def is_complete(self) -> bool:
+        """False when today's realized total is known to be missing something."""
+        return self.unattributed_fills == 0
+
+    @property
     def realized_loss(self) -> Money:
-        """Today's loss as a positive amount; zero if today is profitable."""
+        """Today's loss as a positive amount; zero if today is profitable.
+
+        Read together with :attr:`is_complete`: an incomplete total may
+        understate the loss, and understating it is the direction that matters.
+        """
         current = self.realized
         if current.amount >= 0:
             return Money.zero(self._currency)
@@ -551,6 +583,7 @@ class RiskEngine:
             #    spent the day's loss budget must not mean being unable to close.
             checked.append(RiskLimit.DAILY_LOSS)
             loss = self._pnl.realized_loss
+            complete = self._pnl.is_complete
             if loss >= config.max_daily_loss:
                 if reduces_position:
                     waived.append(RiskLimit.DAILY_LOSS)
@@ -564,6 +597,29 @@ class RiskEngine:
                                 "today"
                             ),
                             observed=str(loss),
+                            allowed=str(config.max_daily_loss),
+                        )
+                    )
+            elif not complete:
+                # Some fill today closed against a basis we never saw, so the
+                # figure above is a floor, not the loss. A budget checked against
+                # an understated loss is not a budget. De-risking is still
+                # allowed, for the same reason it is when the budget is spent.
+                if reduces_position:
+                    waived.append(RiskLimit.DAILY_LOSS)
+                else:
+                    missing = self._pnl.unattributed_fills
+                    breaches.append(
+                        LimitBreach(
+                            limit=RiskLimit.DAILY_LOSS,
+                            message=(
+                                f"{missing} fill(s) today closed a position with no "
+                                f"known cost basis, so today's realized loss {loss} "
+                                "is a lower bound rather than the figure; refusing "
+                                "rather than checking the budget against an "
+                                "understated loss"
+                            ),
+                            observed=f"{loss} (incomplete: {missing} fill(s))",
                             allowed=str(config.max_daily_loss),
                         )
                     )

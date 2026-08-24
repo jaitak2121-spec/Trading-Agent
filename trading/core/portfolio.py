@@ -234,6 +234,12 @@ class FillEffect:
     #: profit".
     realized_pnl: Money
     basis_was_known: bool
+    #: Whether :attr:`realized_pnl` is the whole story. False only when a fill
+    #: *closed against* an unknown basis, where the zero above means "not
+    #: computable". A fill that merely added to an unknown-basis position
+    #: realizes genuinely nothing, so this stays True. The daily-loss limit
+    #: reads this to tell a real zero from a missing number.
+    realized_is_known: bool
     position: Position
 
     def as_details(self) -> dict[str, object]:
@@ -245,6 +251,7 @@ class FillEffect:
             "cash_delta": str(self.cash_delta.amount),
             "realized_pnl": str(self.realized_pnl.amount),
             "basis_was_known": self.basis_was_known,
+            "realized_is_known": self.realized_is_known,
             "position": self.position.as_details(),
         }
 
@@ -363,6 +370,10 @@ class Portfolio:
             basis, realized, basis_was_known = self._reprice(
                 held, before.average_entry_price, signed, price
             )
+            # Only a fill that closes against an unknown basis leaves the
+            # realized figure unknowable. Adding to one realizes nothing at all.
+            reduced = not held.is_zero and (held.amount > 0) != (signed.amount > 0)
+            realized_is_known = basis_was_known or not reduced
 
             if side is OrderSide.BUY:
                 # Round the outflow up and the inflow down: cash is never
@@ -389,6 +400,7 @@ class Portfolio:
                 cash_delta=cash_delta,
                 realized_pnl=realized,
                 basis_was_known=basis_was_known,
+                realized_is_known=realized_is_known,
                 position=Position(
                     symbol=symbol,
                     quantity=after,
