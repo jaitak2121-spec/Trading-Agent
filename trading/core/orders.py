@@ -502,6 +502,104 @@ class Order:
                 target, reason=reason, via_reconciliation=via_reconciliation
             )
 
+    def apply_fill_delta(
+        self,
+        cumulative_quantity: Quantity,
+        cumulative_notional: Decimal,
+        currency: Currency,
+        *,
+        reason: str = "fill",
+        via_reconciliation: bool = False,
+    ) -> tuple[OrderState, Quantity, Price]:
+        """Apply only the delta between cumulative venue state and current local state.
+
+        This method computes the difference between what the venue reports as the
+        total filled quantity and what we have already booked locally, then applies
+        only that increment. It is defensive: regressed quantity, overfills, and
+        currency mismatches all raise :class:`~trading.core.errors.SafetyViolation`.
+
+        Args:
+            cumulative_quantity: Total filled quantity as the venue reports it
+            cumulative_notional: Total notional (price × quantity) the venue reports
+            currency: Currency of the notional
+            reason: Audit trail text
+            via_reconciliation: Whether this is part of the reconciliation path
+
+        Returns:
+            A tuple of (new_state, delta_quantity, delta_price) where delta_quantity
+            and delta_price represent only the incremental fill that was applied.
+            If no delta was applied (idempotent case), returns (state, zero_quantity, zero_price).
+
+        Raises:
+            SafetyViolation: On regressed quantity, overfill, asset mismatch,
+                currency mismatch, or any other defensive refusal
+        """
+        if not isinstance(cumulative_quantity, Quantity):
+            raise TypeError("cumulative_quantity must be a Quantity")
+        if not isinstance(cumulative_notional, Decimal):
+            raise TypeError("cumulative_notional must be Decimal")
+        if not isinstance(currency, Currency):
+            raise TypeError("currency must be Currency")
+
+        with self._lock:
+            # Defensive check: asset must match
+            if cumulative_quantity.asset != self._intent.quantity.asset:
+                raise SafetyViolation(
+                    f"cumulative fill asset {cumulative_quantity.asset} does not match "
+                    f"order asset {self._intent.quantity.asset} on {self._order_id}"
+                )
+
+            # Defensive check: overfill
+            if cumulative_quantity > self._intent.quantity:
+                raise SafetyViolation(
+                    f"overfill on {self._order_id}: venue reports {cumulative_quantity} "
+                    f"filled but ordered quantity is {self._intent.quantity}"
+                )
+
+            # Defensive check: regressed quantity
+            if cumulative_quantity < self._filled_quantity:
+                raise SafetyViolation(
+                    f"regressed fill on {self._order_id}: venue reports "
+                    f"{cumulative_quantity} but we have {self._filled_quantity} "
+                    "already booked"
+                )
+
+            # Defensive check: currency consistency
+            if self._quote_currency is not None and currency != self._quote_currency:
+                raise SafetyViolation(
+                    f"currency mismatch on {self._order_id}: venue reports "
+                    f"{currency.code} but prior fills are in "
+                    f"{self._quote_currency.code}"
+                )
+
+            # Compute delta
+            delta_qty = cumulative_quantity - self._filled_quantity
+
+            # Idempotent: zero delta is a no-op
+            if delta_qty.is_zero:
+                # Return minimal valid price (Price can't be zero)
+                minimal_price = Price("0.000000000001", currency)
+                return (self._state, delta_qty, minimal_price)
+
+            # Compute delta notional and derive delta price
+            with decimal.localcontext(FINANCIAL_CONTEXT):
+                delta_notional = cumulative_notional - self._notional_total
+                delta_price_amount = delta_notional / delta_qty.amount
+                delta_price_amount = delta_price_amount.quantize(
+                    Decimal(1).scaleb(-_PRICE_SCALE), rounding=ROUND_HALF_EVEN
+                )
+
+            delta_price = Price(delta_price_amount, currency)
+
+            # Apply the delta via existing apply_fill logic
+            new_state = self.apply_fill(
+                delta_qty,
+                delta_price,
+                reason=reason,
+                via_reconciliation=via_reconciliation,
+            )
+            return (new_state, delta_qty, delta_price)
+
     def filled_notional(self) -> Money | None:
         """Cash value of everything filled so far, or None if nothing filled."""
         with self._lock:

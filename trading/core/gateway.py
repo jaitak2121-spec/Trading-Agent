@@ -59,6 +59,7 @@ system can do, so there is no retry anywhere in this module.
 
 from __future__ import annotations
 
+import decimal
 import threading
 from typing import Mapping
 
@@ -74,11 +75,11 @@ from .authz import (
 from .breaker import BreakerRegistry
 from .clock import Clock
 from .config import TradingConfig
-from .dedupe import IdempotencyRegistry
+from .dedupe import IdempotencyRegistry, ReservationState
 from .errors import SafetyViolation, UnauthorizedAction
 from .killswitch import KillSwitch
 from .modes import TradingModeMachine
-from .money import Price
+from .money import FINANCIAL_CONTEXT, Price
 from .orders import Order, OrderIntent, OrderState, OrderStore
 from .portfolio import Portfolio
 from .reconciliation import ReconciliationGate
@@ -510,6 +511,108 @@ class ExecutionGateway:
         # reading an understated loss (INVARIANT 7).
         self._risk.pnl.record(effect.realized_pnl, attributed=effect.realized_is_known)
 
+    def _apply_fetched_state(
+        self,
+        order: Order,
+        ack: BrokerAck,
+        *,
+        via_reconciliation: bool,
+    ) -> None:
+        """Interpret cumulative venue state from fetch_order_state and update order.
+
+        This method handles the three definitive outcomes from a broker's
+        fetch_order_state query (REJECTED, ACCEPTED, FILLED) and applies the
+        cumulative state to the local order using delta logic. It performs all
+        defensive refusals for invalid or contradictory venue responses.
+
+        When fills are applied, this method also updates the portfolio by recording
+        only the delta fill, preventing double-booking.
+
+        Args:
+            order: Order to update
+            ack: BrokerAck from fetch_order_state (cumulative snapshot)
+            via_reconciliation: True when called from resolve_unknown
+
+        Raises:
+            SafetyViolation: On broker_order_id mismatch, fill against terminal
+                order, UNCERTAIN response, or any defensive refusal from
+                apply_fill_delta
+        """
+        # Attach broker_order_id if present and not contradictory
+        if ack.broker_order_id:
+            if order.broker_order_id and order.broker_order_id != ack.broker_order_id:
+                raise SafetyViolation(
+                    f"broker_order_id mismatch on {order.order_id}: stored "
+                    f"{order.broker_order_id}, venue reports {ack.broker_order_id}"
+                )
+            order.attach_broker_order_id(ack.broker_order_id)
+
+        # Refuse fills against terminal orders (except via reconciliation from UNKNOWN)
+        if order.state.is_terminal and not (via_reconciliation and order.is_unknown):
+            if (
+                ack.outcome is AckOutcome.FILLED
+                and ack.filled_quantity
+                and not ack.filled_quantity.is_zero
+            ):
+                raise SafetyViolation(
+                    f"venue reports fill against terminal order {order.order_id} "
+                    f"in state {order.state.value}"
+                )
+
+        if ack.outcome is AckOutcome.REJECTED:
+            # Venue has no record - order never existed or was purged
+            order.transition_to(
+                OrderState.REJECTED,
+                reason="venue has no record of this order",
+                via_reconciliation=via_reconciliation,
+            )
+        elif ack.outcome is AckOutcome.FILLED:
+            # Apply cumulative fill as delta
+            if ack.filled_quantity is None or ack.fill_price is None:
+                raise SafetyViolation(
+                    f"FILLED ack for {order.order_id} missing quantity or price"
+                )
+
+            # Compute cumulative notional from ack
+            with decimal.localcontext(FINANCIAL_CONTEXT):
+                cumulative_notional = ack.fill_price.amount * ack.filled_quantity.amount
+
+            new_state, delta_qty, delta_price = order.apply_fill_delta(
+                cumulative_quantity=ack.filled_quantity,
+                cumulative_notional=cumulative_notional,
+                currency=ack.fill_price.currency,
+                reason=(
+                    "fill sync from venue"
+                    if not via_reconciliation
+                    else "fill discovered during reconciliation"
+                ),
+                via_reconciliation=via_reconciliation,
+            )
+
+            # Record only the delta fill in the portfolio (if any delta was applied)
+            if not delta_qty.is_zero:
+                delta_ack = BrokerAck(
+                    outcome=AckOutcome.FILLED,
+                    broker_order_id=ack.broker_order_id,
+                    filled_quantity=delta_qty,
+                    fill_price=delta_price,
+                )
+                self._record_fill(order, delta_ack)
+        elif ack.outcome is AckOutcome.ACCEPTED:
+            # Order resting at venue
+            order.transition_to(
+                OrderState.ACCEPTED,
+                reason="order found resting at venue",
+                via_reconciliation=via_reconciliation,
+            )
+        elif ack.outcome is AckOutcome.UNCERTAIN:
+            # UNCERTAIN should not come from fetch_order_state in normal brokers,
+            # but if it does, it's a sign something is wrong
+            raise SafetyViolation(
+                f"fetch_order_state returned UNCERTAIN for {order.order_id}; "
+                "this should not happen on a direct query"
+            )
+
     def _to_unknown(
         self, order: Order, *, reason: str, ack: BrokerAck | None
     ) -> ExecutionResult:
@@ -645,31 +748,21 @@ class ExecutionGateway:
             )
             return ack
 
-        if ack.outcome is AckOutcome.REJECTED:
-            order.transition_to(
-                OrderState.REJECTED,
-                reason="venue has no record of this order",
-                via_reconciliation=True,
-            )
-        elif ack.outcome is AckOutcome.FILLED:
-            assert ack.filled_quantity is not None and ack.fill_price is not None
-            order.apply_fill(
-                ack.filled_quantity,
-                ack.fill_price,
-                reason="fill discovered during reconciliation",
-                via_reconciliation=True,
-            )
-            self._record_fill(order, ack)
-        else:
-            order.transition_to(
-                OrderState.ACCEPTED,
-                reason="order found resting at venue",
-                via_reconciliation=True,
+        # Use _apply_fetched_state for consistent cumulative-to-delta handling.
+        # This prevents double-booking when the order had prior fills before
+        # becoming UNKNOWN. The method handles both order state update and
+        # portfolio delta recording internally.
+        self._apply_fetched_state(order, ack, via_reconciliation=True)
+
+        # Clear the reservation's UNKNOWN state, but only if it's actually UNKNOWN.
+        # The order might have been marked UNKNOWN while the reservation stayed
+        # SUBMITTED or was already SETTLED.
+        reservation = self._dedupe.get(order.idempotency_key)
+        if reservation and reservation.state is ReservationState.UNKNOWN:
+            self._dedupe.resolve_unknown(
+                order.idempotency_key, resolution=f"venue reported {ack.outcome.value}"
             )
 
-        self._dedupe.resolve_unknown(
-            order.idempotency_key, resolution=f"venue reported {ack.outcome.value}"
-        )
         self._audit.record(
             AuditCategory.RECONCILIATION,
             "gateway.unknown_resolved",
