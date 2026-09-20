@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import decimal
 import threading
-from typing import Mapping
+from typing import Mapping, NoReturn
 
 from .audit import AuditCategory, AuditLog, AuditOutcome
 from .authz import (
@@ -517,6 +517,7 @@ class ExecutionGateway:
         ack: BrokerAck,
         *,
         via_reconciliation: bool,
+        after_cancel: bool = False,
     ) -> None:
         """Interpret cumulative venue state from fetch_order_state and update order.
 
@@ -532,62 +533,103 @@ class ExecutionGateway:
             order: Order to update
             ack: BrokerAck from fetch_order_state (cumulative snapshot)
             via_reconciliation: True when called from resolve_unknown
+            after_cancel: True when the venue was just asked to cancel this
+                order and acknowledged. It changes exactly one thing: a
+                "no record" answer stops meaning REJECTED. See the REJECTED
+                branch below.
 
         Raises:
             SafetyViolation: On broker_order_id mismatch, fill against terminal
                 order, UNCERTAIN response, or any defensive refusal from
-                apply_fill_delta
+                apply_fill_delta. Every refusal is audited before it is raised
+                (INVARIANT 13), and leaves the order untouched.
         """
-        # Attach broker_order_id if present and not contradictory
-        if ack.broker_order_id:
-            if order.broker_order_id and order.broker_order_id != ack.broker_order_id:
-                raise SafetyViolation(
-                    f"broker_order_id mismatch on {order.order_id}: stored "
-                    f"{order.broker_order_id}, venue reports {ack.broker_order_id}"
-                )
-            order.attach_broker_order_id(ack.broker_order_id)
-
-        # Refuse fills against terminal orders (except via reconciliation from UNKNOWN)
-        if order.state.is_terminal and not (via_reconciliation and order.is_unknown):
-            if (
-                ack.outcome is AckOutcome.FILLED
-                and ack.filled_quantity
-                and not ack.filled_quantity.is_zero
-            ):
-                raise SafetyViolation(
-                    f"venue reports fill against terminal order {order.order_id} "
-                    f"in state {order.state.value}"
-                )
-
-        if ack.outcome is AckOutcome.REJECTED:
-            # Venue has no record - order never existed or was purged
-            order.transition_to(
-                OrderState.REJECTED,
-                reason="venue has no record of this order",
-                via_reconciliation=via_reconciliation,
+        # -- validation ------------------------------------------------------
+        # Every refusal below runs before anything mutates, so a contradictory
+        # venue answer leaves the order exactly as it was. In particular the
+        # broker_order_id is attached at the *end* of this method rather than
+        # here: attaching first would leave a refused response half-applied.
+        if (
+            ack.broker_order_id
+            and order.broker_order_id
+            and order.broker_order_id != ack.broker_order_id
+        ):
+            self._refuse_venue_state(
+                order,
+                ack,
+                f"broker_order_id mismatch on {order.order_id}: stored "
+                f"{order.broker_order_id}, venue reports {ack.broker_order_id}",
             )
-        elif ack.outcome is AckOutcome.FILLED:
-            # Apply cumulative fill as delta
-            if ack.filled_quantity is None or ack.fill_price is None:
-                raise SafetyViolation(
-                    f"FILLED ack for {order.order_id} missing quantity or price"
+
+        if ack.outcome is AckOutcome.UNCERTAIN:
+            # UNCERTAIN should not come from fetch_order_state in normal brokers,
+            # but if it does, it is a sign something is wrong.
+            self._refuse_venue_state(
+                order,
+                ack,
+                f"fetch_order_state returned UNCERTAIN for {order.order_id}; "
+                "this should not happen on a direct query",
+            )
+
+        if ack.outcome is AckOutcome.FILLED:
+            # BrokerAck.__post_init__ already guarantees both are present on a
+            # FILLED ack, so this is a type-checker aid, not a second check --
+            # the same reasoning (and the same assert) as _settle.
+            assert ack.filled_quantity is not None and ack.fill_price is not None
+            # Refuse a fill against an order that already reached a terminal
+            # state. UNKNOWN is deliberately *not* in TERMINAL_STATES, so an
+            # order being resolved out of UNKNOWN passes this guard on its own
+            # -- learning what actually happened is the whole point of that
+            # path, and it needs no exemption here.
+            if not ack.filled_quantity.is_zero and order.state.is_terminal:
+                self._refuse_venue_state(
+                    order,
+                    ack,
+                    f"venue reports fill against terminal order {order.order_id} "
+                    f"in state {order.state.value}",
                 )
 
+        # -- application -----------------------------------------------------
+        if ack.outcome is AckOutcome.REJECTED:
+            # "The venue has no record" normally means the order never existed,
+            # so REJECTED is the honest reading. Immediately after a cancel the
+            # venue acknowledged, it means the opposite: the venue *did* have
+            # the order and we withdrew it. Calling that REJECTED would claim
+            # the venue never took the order, a stronger and different claim.
+            # cancel() makes the CANCELED transition itself, once it has
+            # confirmed nothing else got there first.
+            if not after_cancel:
+                self._transition_or_refuse(
+                    order,
+                    ack,
+                    OrderState.REJECTED,
+                    reason="venue has no record of this order",
+                    via_reconciliation=via_reconciliation,
+                )
+        elif ack.outcome is AckOutcome.FILLED:
             # Compute cumulative notional from ack
             with decimal.localcontext(FINANCIAL_CONTEXT):
                 cumulative_notional = ack.fill_price.amount * ack.filled_quantity.amount
 
-            new_state, delta_qty, delta_price = order.apply_fill_delta(
-                cumulative_quantity=ack.filled_quantity,
-                cumulative_notional=cumulative_notional,
-                currency=ack.fill_price.currency,
-                reason=(
-                    "fill sync from venue"
-                    if not via_reconciliation
-                    else "fill discovered during reconciliation"
-                ),
-                via_reconciliation=via_reconciliation,
-            )
+            # Order's own defensive refusals -- regressed quantity, overfill,
+            # asset and currency mismatch -- surface as SafetyViolation. They
+            # refuse before mutating, so auditing here still precedes any
+            # effect (INVARIANT 13). Order holds no audit log by design.
+            try:
+                _, delta_qty, delta_price = order.apply_fill_delta(
+                    cumulative_quantity=ack.filled_quantity,
+                    cumulative_notional=cumulative_notional,
+                    currency=ack.fill_price.currency,
+                    reason=(
+                        "fill sync from venue"
+                        if not via_reconciliation
+                        else "fill discovered during reconciliation"
+                    ),
+                    via_reconciliation=via_reconciliation,
+                )
+            except SafetyViolation as exc:
+                self._audit_venue_refusal(order, ack, str(exc))
+                raise
 
             # Record only the delta fill in the portfolio (if any delta was applied)
             if not delta_qty.is_zero:
@@ -599,19 +641,69 @@ class ExecutionGateway:
                 )
                 self._record_fill(order, delta_ack)
         elif ack.outcome is AckOutcome.ACCEPTED:
-            # Order resting at venue
+            # The venue confirms the order is working. If we already believe
+            # that, there is nothing to record: ACCEPTED -> ACCEPTED is absent
+            # from the transition table because re-affirming a state is not a
+            # change. Any *other* disagreement -- a venue calling an order
+            # merely resting when we have booked fills against it -- is a real
+            # contradiction, and refuses rather than quietly unwinding them.
+            if order.state is not OrderState.ACCEPTED:
+                self._transition_or_refuse(
+                    order,
+                    ack,
+                    OrderState.ACCEPTED,
+                    reason="order found resting at venue",
+                    via_reconciliation=via_reconciliation,
+                )
+
+        # Bind the venue's identifier only now that its answer has been applied.
+        if ack.broker_order_id:
+            order.attach_broker_order_id(ack.broker_order_id)
+
+    def _transition_or_refuse(
+        self,
+        order: Order,
+        ack: BrokerAck,
+        target: OrderState,
+        *,
+        reason: str,
+        via_reconciliation: bool,
+    ) -> None:
+        """Move the order, auditing first if the state machine refuses.
+
+        ``transition_to`` raises :class:`InvalidOrderTransition`, which is a
+        :class:`SafetyViolation` like any other refusal here -- and like the
+        others it must not disappear from the trail (INVARIANT 13). It refuses
+        before mutating, so auditing on the way out still precedes any effect.
+        """
+        try:
             order.transition_to(
-                OrderState.ACCEPTED,
-                reason="order found resting at venue",
-                via_reconciliation=via_reconciliation,
+                target, reason=reason, via_reconciliation=via_reconciliation
             )
-        elif ack.outcome is AckOutcome.UNCERTAIN:
-            # UNCERTAIN should not come from fetch_order_state in normal brokers,
-            # but if it does, it's a sign something is wrong
-            raise SafetyViolation(
-                f"fetch_order_state returned UNCERTAIN for {order.order_id}; "
-                "this should not happen on a direct query"
-            )
+        except SafetyViolation as exc:
+            self._audit_venue_refusal(order, ack, str(exc))
+            raise
+
+    def _audit_venue_refusal(self, order: Order, ack: BrokerAck, reason: str) -> None:
+        """Record a refusal to apply a venue's answer. Nothing has changed yet."""
+        self._audit.record(
+            AuditCategory.RECONCILIATION,
+            "gateway.venue_state_refused",
+            outcome=AuditOutcome.REFUSED,
+            actor=self._identity.principal_id,
+            details={
+                "order_id": order.order_id,
+                "state": order.state.value,
+                "idempotency_key": order.idempotency_key,
+                "reason": reason,
+                "ack": ack.as_details(),
+            },
+        )
+
+    def _refuse_venue_state(self, order: Order, ack: BrokerAck, reason: str) -> NoReturn:
+        """Audit a contradictory venue answer, then refuse it (INVARIANT 13)."""
+        self._audit_venue_refusal(order, ack, reason)
+        raise SafetyViolation(reason)
 
     def _to_unknown(
         self, order: Order, *, reason: str, ack: BrokerAck | None
@@ -711,17 +803,134 @@ class ExecutionGateway:
     # -- operator actions -------------------------------------------------
 
     def cancel(self, order: Order, *, operator: Principal) -> BrokerAck:
-        """Cancel an order. Needs no risk approval: it can only reduce exposure."""
+        """Cancel an order, then reconcile what the venue actually did.
+
+        Needs no risk approval: cancelling can only reduce exposure. It does
+        need the gateway lock, because it can book a fill.
+
+        A cancel acknowledgement is not an outcome. The venue may have filled
+        the order while the request was in flight, so this asks the venue for
+        its authoritative state afterwards and applies that. A fill that won
+        the race is booked exactly once and the order reaches FILLED, instead
+        of being quietly retired as CANCELED with a position nobody recorded.
+
+        Returns the acknowledgement to the *cancel request*, because that is
+        the question the caller asked -- whether the cancel went through. The
+        authoritative outcome is ``order.state``, which this has just updated.
+
+        Raises:
+            UnauthorizedAction: ``operator`` may not cancel orders.
+            SafetyViolation: the order is UNKNOWN (resolve it first) or already
+                terminal -- refused before anything is sent -- or the venue's
+                answer to the follow-up query was contradictory, in which case
+                the cancel was sent but the order is left as it was. Every
+                refusal is audited before it is raised (INVARIANT 13).
+        """
+        with self._lock:
+            return self._cancel_locked(order, operator)
+
+    def _cancel_locked(self, order: Order, operator: Principal) -> BrokerAck:
         authorize(operator, Action.CANCEL_ORDER)
-        ack = self._broker.cancel_order(order)
+
+        # An UNKNOWN order must not be cancelled. We do not know whether the
+        # venue holds it, so "cancel" would be a guess, and the answer to the
+        # follow-up query would have nothing to reconcile against.
+        # resolve_unknown() is the only way out of that state (INVARIANT 5).
+        if order.is_unknown:
+            self._refuse_cancel(
+                order,
+                operator,
+                f"order {order.order_id} is UNKNOWN; "
+                "resolve it before trying to cancel it",
+            )
+
+        state = order.state
+        if state.is_terminal:
+            # Also what makes a second cancel refuse cleanly rather than send
+            # a pointless request: the first one left the order CANCELED.
+            self._refuse_cancel(
+                order,
+                operator,
+                f"order {order.order_id} is already {state.value}; nothing to cancel",
+            )
+
+        # INVARIANT 13: the intent is recorded before the request leaves, so a
+        # crash in flight still leaves evidence that we asked.
         self._audit.record(
             AuditCategory.ORDER,
             "gateway.cancel_requested",
             outcome=AuditOutcome.ALLOWED,
             actor=operator.principal_id,
-            details={"order_id": order.order_id, "ack": ack.as_details()},
+            details={
+                "order_id": order.order_id,
+                "state": state.value,
+                "idempotency_key": order.idempotency_key,
+            },
         )
-        return ack
+
+        cancel_ack = self._broker.cancel_order(order)
+        # Only a definitive acknowledgement proves the request landed. UNCERTAIN
+        # does not, and CANCELED will not be declared on a guess.
+        cancel_succeeded = cancel_ack.outcome is AckOutcome.ACCEPTED
+
+        # The venue decides what happened, not its acknowledgement. Any fill
+        # that beat the cancel is booked here, exactly once: _apply_fetched_state
+        # applies the delta against what is already on the books, so a fill we
+        # had already recorded produces no second position and no second P&L.
+        fetched = self._broker.fetch_order_state(order)
+        self._apply_fetched_state(
+            order,
+            fetched,
+            via_reconciliation=False,
+            after_cancel=cancel_succeeded,
+        )
+
+        # CANCELED only when nothing else got there first. A fetched ACCEPTED
+        # means the order is still working at the venue whatever the cancel
+        # acknowledgement claimed, and retiring it here would hide an order
+        # that can still fill. A fetched FILLED has already left the order
+        # terminal, so is_open closes that case too.
+        if (
+            cancel_succeeded
+            and fetched.outcome is not AckOutcome.ACCEPTED
+            and order.is_open
+        ):
+            order.transition_to(
+                OrderState.CANCELED, reason="canceled at operator request"
+            )
+
+        self._audit.record(
+            AuditCategory.ORDER,
+            "gateway.cancel_completed",
+            outcome=AuditOutcome.ALLOWED if cancel_succeeded else AuditOutcome.REFUSED,
+            actor=operator.principal_id,
+            details={
+                "order_id": order.order_id,
+                "state": order.state.value,
+                "idempotency_key": order.idempotency_key,
+                "ack": cancel_ack.as_details(),
+                "venue_state": fetched.as_details(),
+            },
+        )
+        return cancel_ack
+
+    def _refuse_cancel(
+        self, order: Order, operator: Principal, reason: str
+    ) -> NoReturn:
+        """Audit a refused cancel, then refuse it. Nothing was sent (INVARIANT 13)."""
+        self._audit.record(
+            AuditCategory.ORDER,
+            "gateway.cancel_refused",
+            outcome=AuditOutcome.REFUSED,
+            actor=operator.principal_id,
+            details={
+                "order_id": order.order_id,
+                "state": order.state.value,
+                "idempotency_key": order.idempotency_key,
+                "reason": reason,
+            },
+        )
+        raise SafetyViolation(reason)
 
     def resolve_unknown(self, order: Order, *, operator: Principal) -> BrokerAck:
         """Ask the venue what happened to an UNKNOWN order and record the answer.
