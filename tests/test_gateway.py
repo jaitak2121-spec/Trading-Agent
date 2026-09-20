@@ -845,11 +845,15 @@ class TestNothingBypassesTheGateway(GatewayFixture):
         self.assertEqual(public, {"submit", "cancel", "resolve_unknown"})
 
     def test_cancel_needs_no_risk_approval_but_does_need_a_permission(self):
+        # An order that is actually open: the default rig fills immediately,
+        # and cancel now refuses a terminal order before it sends anything.
+        self.rig.broker.script(BrokerAck(AckOutcome.ACCEPTED, broker_order_id="b-1"))
         result = self.rig.submit()
         with self.assertRaises(UnauthorizedAction):
             self.rig.gateway.cancel(result.order, operator=self.rig.strategy_id)
         ack = self.rig.gateway.cancel(result.order, operator=self.rig.operator_id)
         self.assertEqual(ack.outcome, AckOutcome.ACCEPTED)
+        self.assertEqual(result.order.state, OrderState.CANCELED)
 
     def _order(self):
         from trading.core.orders import Order

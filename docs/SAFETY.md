@@ -491,6 +491,19 @@ exists, and reports ENGAGED if it cannot tell:
 touch "$TRADING_KILL_SWITCH_PATH"
 ```
 
+**Cancel an order.** No risk approval — cancelling can only reduce exposure. The
+acknowledgement is not the outcome: the venue may have filled the order while the
+request was in flight, so the gateway reads the venue's authoritative state
+afterwards, books any fill that won the race exactly once, and declares `CANCELED`
+only if the order is still open. A fill always beats a cancel. Refuses an order
+that is already terminal, and refuses an `UNKNOWN` one without sending anything —
+resolve that first, since "cancel" against an order we cannot place is a guess.
+
+```python
+ack = gateway.cancel(order, operator=operator)   # ack answers "did the cancel
+                                                 # land?"; order.state is the truth
+```
+
 **Resolve an UNKNOWN order.** The only exit from `UNKNOWN` is asking the venue.
 Time does not clear it: a day of waiting leaves the block in place.
 
@@ -544,8 +557,8 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 155
-   tests in ~4 s. There is no reason to run a subset.
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 505
+   tests in ~2 s. There is no reason to run a subset.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and
 for the seams a later stage attaches to.

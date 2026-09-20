@@ -425,7 +425,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 462 tests, ~3 s, 96.7% statement coverage (5 992 statements, 199 missed).
+1 505 tests, ~2 s, 96.7% statement coverage (6 175 statements, 202 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -455,6 +455,9 @@ python3 -m unittest discover -s tests -t .
 | `test_modes.py` | 34 | Transition table |
 | `test_clock.py` | 33 | `SystemClock` and `ManualClock` |
 | `test_ports.py` | 22 | Ports abstract; implementations conform by signature |
+| `test_cancel.py` | 20 | The cancel/fill race, and which answer wins |
+| `test_lifecycle.py` | 16 | Cumulative-to-delta fills, and every refusal of a venue's answer |
+| `test_resolve_unknown.py` | 7 | Resolving UNKNOWN without double-booking a prior fill |
 
 Coverage is measured with the stdlib `trace` module, since `coverage.py` would be
 a third-party dependency. Do **not** read the figure off `trace --summary`: its
@@ -481,7 +484,7 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 199 missed statements are overwhelmingly unreachable-by-design: the `...`
+The 202 missed statements are overwhelmingly unreachable-by-design: the `...`
 bodies of abstract port methods (all six misses in `ports/repository.py`), and
 defensive `raise TypeError` / `raise ConfigurationError` guards against argument
 types the surrounding code already prevents. A handful are unexercised `__repr__`
