@@ -363,10 +363,10 @@ and a P&L figure rounds toward a loss.
 
 **One derivation of realized P&L, and one place it enters the risk engine.**
 *(Stage 2.)* `MAX_DAILY_LOSS` reads `PnlLedger`, and the only production writer to
-that ledger is `ExecutionGateway._record_fill`, which both fill sites — the
-ordinary `_settle` path and the `resolve_unknown` recovery path — funnel through,
-so a loss discovered during reconciliation counts exactly as much as one we
-watched happen. `_record_fill` takes the figure straight off `FillEffect` rather
+that ledger is `ExecutionGateway._record_fill`, which every fill site — the
+ordinary `_settle` path and the two that read the venue's own answer,
+`sync_order` and `resolve_unknown` — funnels through, so a loss discovered
+during reconciliation counts exactly as much as one we watched happen. `_record_fill` takes the figure straight off `FillEffect` rather
 than recomputing it from price and basis: the basis lives in the portfolio, and a
 second derivation would be a second answer to the same question with its own way
 of being wrong. The wiring errors that would otherwise surface mid-fill are moved
@@ -425,7 +425,7 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 505 tests, ~2 s, 96.7% statement coverage (6 175 statements, 202 missed).
+1 540 tests, ~2 s, 96.8% statement coverage (6 241 statements, 202 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -451,6 +451,7 @@ python3 -m unittest discover -s tests -t .
 | `test_indicators.py` | 42 | Insufficient-data `None`, gap-aware true range, input validation |
 | `test_sizing.py` | 42 | Round-down, verify-the-result |
 | `test_secrets.py` | 37 | Containment and scrubbing |
+| `test_sync.py` | 35 | A fill discovered after the ack reaching the portfolio exactly once, and every refusal that keeps it from arriving twice |
 | `test_authz.py` | 34 | Role matrix, token single-use and TTL |
 | `test_modes.py` | 34 | Transition table |
 | `test_clock.py` | 33 | `SystemClock` and `ManualClock` |
@@ -510,7 +511,7 @@ Every seam is already named. Nothing in `trading.core` changes.
 |---|---|---|
 | PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. |
 | CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `PaperBroker` is the reference for the shape of an honest ack; `SimulatedBroker` is the reference for the failure modes a real client will actually hit. Unlike either, a network client *can* be genuinely in doubt, so it must answer `UNCERTAIN` rather than guess. |
-| Order lifecycle beyond the ack | `PaperBroker.fetch_order_state` | A non-crossing limit rests and stays resting: there is no path today for a fill discovered outside `place_order` to reach the portfolio except operator `resolve_unknown`. Driving a resting order to a fill is a lifecycle change, and it belongs in core, not in an adapter. |
+| Order lifecycle beyond the ack | `PaperBroker.fetch_order_state` | The core half exists: `ExecutionGateway.sync_order` asks the venue what a resting order has become and books the cumulative answer as a delta, so a fill discovered after the ack reaches the portfolio without an operator resolving an UNKNOWN. What is missing is a venue that can *have* such an answer — `PaperBroker` derives its reply from what it was told at placement, so a non-crossing limit rests and stays resting no matter how the market moves. Driving a resting order to a fill against the book is the adapter's half. |
 | Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. An *advisory* endpoint calls `Advisor.advise` instead and needs no gateway at all — the two halves of the API are wired to different layers. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |

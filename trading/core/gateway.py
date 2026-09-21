@@ -914,13 +914,152 @@ class ExecutionGateway:
         )
         return cancel_ack
 
+    def sync_order(self, order: Order, *, operator: Principal) -> BrokerAck:
+        """Ask the venue what an open order has become, and apply the answer.
+
+        The route a fill takes when nobody was watching. ``place_order`` reports
+        what happened at the moment of placement; an order that rests at the
+        venue and fills ten minutes later has no other way into the portfolio.
+        Without this a resting order stays ACCEPTED forever and its fill is
+        invisible to the position ledger, to the cost basis, and therefore to
+        the daily-loss limit.
+
+        The venue's answer is a *cumulative* snapshot, and only the delta
+        against what is already booked reaches the portfolio. Syncing the same
+        order twice books nothing the second time, so a poller may run as often
+        as it likes without inventing a position.
+
+        Authorised by :data:`Action.RECONCILE` rather than ``CANCEL_ORDER``:
+        this asks the venue what is true instead of telling it to do anything.
+        That is also why ``SYSTEM`` holds it -- the periodic poller a later
+        stage adds runs unattended, and an operator will not be awake for it.
+
+        Takes the gateway lock, because applying the answer can move the
+        portfolio and the risk ledger, and a concurrent ``submit`` must not
+        weigh its limits against a position changing underneath it.
+
+        Returns the venue's acknowledgement. The authoritative outcome is
+        ``order.state``, which this has just updated.
+
+        Raises:
+            UnauthorizedAction: ``operator`` may not reconcile.
+            SafetyViolation: the order is UNKNOWN or already terminal -- both
+                refused before the venue is asked -- or the venue's answer was
+                contradictory, in which case the order is left exactly as it
+                was. Every refusal is audited before it is raised
+                (INVARIANT 13).
+        """
+        with self._lock:
+            return self._sync_locked(order, operator)
+
+    def _sync_locked(self, order: Order, operator: Principal) -> BrokerAck:
+        authorize(operator, Action.RECONCILE)
+
+        # An UNKNOWN order is not syncable, though the mechanics would work.
+        # Leaving UNKNOWN is a deliberate operator act with its own audit trail
+        # and its own reservation bookkeeping (INVARIANT 5); resolve_unknown is
+        # that act, and a routine poll must not perform it silently.
+        if order.is_unknown:
+            self._refuse_sync(
+                order,
+                operator,
+                f"order {order.order_id} is UNKNOWN; resolve it rather than syncing it",
+            )
+
+        state = order.state
+        if state.is_terminal:
+            # Nothing a venue says about a finished order is news, and
+            # _apply_fetched_state refuses a fill against a terminal order
+            # anyway -- including a re-report of the very fill that finished it.
+            # Refusing here stops an ordinary poll from looking like a
+            # contradiction the venue never intended.
+            self._refuse_sync(
+                order,
+                operator,
+                f"order {order.order_id} is already {state.value}; nothing to sync",
+            )
+
+        # Reading changes nothing at the venue, so INVARIANT 13 does not demand
+        # this record. It is here so the trail can tell a poll that never
+        # returned from a poll that never happened.
+        self._audit.record(
+            AuditCategory.RECONCILIATION,
+            "gateway.sync_requested",
+            outcome=AuditOutcome.ALLOWED,
+            actor=operator.principal_id,
+            details={
+                "order_id": order.order_id,
+                "state": state.value,
+                "idempotency_key": order.idempotency_key,
+            },
+        )
+
+        ack = self._broker.fetch_order_state(order)
+        # via_reconciliation stays False: that flag exists to let an order leave
+        # UNKNOWN, and this path refused every UNKNOWN order above. An UNCERTAIN
+        # answer is refused in there rather than marking the order UNKNOWN -- a
+        # read that failed is not the same as an order we cannot account for,
+        # and latching the system on every unanswered poll would make a network
+        # blip indistinguishable from a lost order.
+        self._apply_fetched_state(order, ack, via_reconciliation=False)
+
+        self._audit.record(
+            AuditCategory.RECONCILIATION,
+            "gateway.sync_completed",
+            outcome=AuditOutcome.ALLOWED,
+            actor=operator.principal_id,
+            details={
+                "order_id": order.order_id,
+                "state": order.state.value,
+                "previous_state": state.value,
+                "idempotency_key": order.idempotency_key,
+                "ack": ack.as_details(),
+            },
+        )
+        return ack
+
     def _refuse_cancel(
         self, order: Order, operator: Principal, reason: str
     ) -> NoReturn:
         """Audit a refused cancel, then refuse it. Nothing was sent (INVARIANT 13)."""
+        self._refuse_order_action(
+            order,
+            operator,
+            reason,
+            category=AuditCategory.ORDER,
+            action="gateway.cancel_refused",
+        )
+
+    def _refuse_sync(
+        self, order: Order, operator: Principal, reason: str
+    ) -> NoReturn:
+        """Audit a refused sync, then refuse it. The venue was never asked."""
+        self._refuse_order_action(
+            order,
+            operator,
+            reason,
+            category=AuditCategory.RECONCILIATION,
+            action="gateway.sync_refused",
+        )
+
+    def _refuse_order_action(
+        self,
+        order: Order,
+        operator: Principal,
+        reason: str,
+        *,
+        category: AuditCategory,
+        action: str,
+    ) -> NoReturn:
+        """Record an operator's request that was refused before it was attempted.
+
+        These refusals all happen before anything leaves the process, so the
+        record is the whole story: the order is exactly as it was, and the venue
+        never heard about it.
+        """
         self._audit.record(
-            AuditCategory.ORDER,
-            "gateway.cancel_refused",
+            category,
+            action,
             outcome=AuditOutcome.REFUSED,
             actor=operator.principal_id,
             details={
@@ -938,7 +1077,21 @@ class ExecutionGateway:
         This is the only way out of the UNKNOWN state, and it requires the venue
         to speak. There is no timeout after which an unknown order is assumed
         dead: assuming is how you end up with two positions.
+
+        Takes the gateway lock for the same reason ``submit``, ``cancel`` and
+        ``sync_order`` do: discovering what an unknown order did can book a
+        fill, and every path that moves the portfolio has to be serialised
+        against every other one. The individual ledgers guard their own writes,
+        but a ``submit`` weighing its risk limits reads several of them in turn,
+        and a fill landing between those reads would be judged against a
+        position that no longer exists.
         """
+        with self._lock:
+            return self._resolve_unknown_locked(order, operator)
+
+    def _resolve_unknown_locked(
+        self, order: Order, operator: Principal
+    ) -> BrokerAck:
         authorize(operator, Action.RECONCILE)
         if not order.is_unknown:
             raise SafetyViolation(

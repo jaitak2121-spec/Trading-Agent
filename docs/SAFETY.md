@@ -420,11 +420,12 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   trusting any P&L figure that includes them.
 - **A daily-loss total that is complete.** *(Stage 2, partly closed.)* Every fill
   the gateway books now records the portfolio's realized figure into `PnlLedger`,
-  so `MAX_DAILY_LOSS` fires on a real losing day — both for fills we watched and
-  for fills discovered by `resolve_unknown`. What is *not* guaranteed is that the
-  total is the whole loss: a fill that closes against an unknown cost basis (see
-  the next bullet) realizes an amount that cannot be computed, and zero would be
-  a lie. Such a fill is recorded as unattributed, and the limit then **refuses
+  so `MAX_DAILY_LOSS` fires on a real losing day — for fills we watched, for
+  fills a later `sync_order` discovers, and for fills discovered by
+  `resolve_unknown`. What is *not* guaranteed is that the total is the whole
+  loss: a fill that closes against an unknown cost basis (see the next bullet)
+  realizes an amount that cannot be computed, and zero would be a lie. Such a
+  fill is recorded as unattributed, and the limit then **refuses
   every opening order for the rest of the day** rather than checking the budget
   against an understated loss. De-risking is still permitted, on the same
   reasoning as a spent budget. The operational consequence is real: one adopted
@@ -504,8 +505,31 @@ ack = gateway.cancel(order, operator=operator)   # ack answers "did the cancel
                                                  # land?"; order.state is the truth
 ```
 
+**Sync an open order with the venue.** Asks what a resting order has become and
+applies the answer. This is how a fill that happened after the ack reaches the
+position ledger and the daily-loss total at all; without it the order stays
+`ACCEPTED` forever and the position is invisible to every limit that reads it.
+The venue's answer is cumulative and only the delta is booked, so syncing the
+same order repeatedly books nothing after the first time — a poller may run as
+often as it likes. Authorized by `RECONCILE` rather than `CANCEL_ORDER`, because
+it asks rather than tells; `SYSTEM` holds it so an unattended poller can use it.
+Refuses a terminal order and an `UNKNOWN` one without sending anything, and
+refuses an answer that contradicts what is already booked — an overfill, a
+shrinking cumulative quantity, a changed currency, a different `broker_order_id`
+— leaving the order exactly as it was. A read that fails (`UNCERTAIN`) is
+refused too, and deliberately does **not** mark the order `UNKNOWN`: a poll that
+went unanswered is not an order we cannot account for, and latching on every
+network blip would hide the difference.
+
+```python
+ack = gateway.sync_order(order, operator=operator)   # order.state is the answer
+```
+
 **Resolve an UNKNOWN order.** The only exit from `UNKNOWN` is asking the venue.
-Time does not clear it: a day of waiting leaves the block in place.
+Time does not clear it: a day of waiting leaves the block in place. Distinct
+from `sync_order`, which refuses an `UNKNOWN` order: leaving that state is a
+deliberate operator act with its own reservation bookkeeping, and a routine poll
+must not perform it silently.
 
 ```python
 ack = gateway.resolve_unknown(order, operator=operator)
@@ -557,7 +581,7 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 505
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 540
    tests in ~2 s. There is no reason to run a subset.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and
