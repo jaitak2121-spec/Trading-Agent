@@ -842,7 +842,13 @@ class TestNothingBypassesTheGateway(GatewayFixture):
             for name in dir(self.rig.gateway)
             if not name.startswith("_") and callable(getattr(self.rig.gateway, name))
         }
-        self.assertEqual(public, {"submit", "cancel", "resolve_unknown"})
+        # Every name here is a deliberate decision, which is why this asserts
+        # equality rather than membership: a method that appears without a
+        # reviewer noticing is exactly what this test exists to prevent.
+        # `submit` is the only one that can create exposure. The other three
+        # read the venue and reconcile local state to it, and none of them can
+        # reach `place_order`.
+        self.assertEqual(public, {"submit", "cancel", "sync_order", "resolve_unknown"})
 
     def test_cancel_needs_no_risk_approval_but_does_need_a_permission(self):
         # An order that is actually open: the default rig fills immediately,

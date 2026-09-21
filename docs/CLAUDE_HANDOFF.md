@@ -47,7 +47,7 @@ not add an import to `core/` or `ports/` without reading that test file first.
 
 ### The chokepoint
 
-`ExecutionGateway.submit` (`trading/core/gateway.py`, 684 lines) is the single
+`ExecutionGateway.submit` (`trading/core/gateway.py`, 1139 lines) is the single
 path to execution. It runs ten gates in a fixed order:
 
 ```
@@ -103,9 +103,24 @@ caps what one placement can take (which is how partial fills first became
 producible in this repository), a non-crossing limit rests, and a missing or
 stale quote is a refusal rather than a guess.
 
-**Stage 2G is next and has not been started.** Verified by grep: no `amend`,
-`replace`, `sync`, or `lifecycle` production code exists anywhere under
-`trading/`. Nothing is half-finished; there is no work-in-progress to pick up.
+**Stage 2G is in progress.** Three increments are committed or staged, each one
+a whole capability rather than a slice of one:
+
+1. **Cancel reconciles what the venue actually did** (`26625d1`). `cancel` no
+   longer trusts its own acknowledgement — it reads the venue's authoritative
+   state afterwards, books a fill that won the race exactly once, and declares
+   `CANCELED` only if the order is still open. A fill always beats a cancel.
+2. **`ExecutionGateway.sync_order`** — the lifecycle-sync entry point. A fill
+   that happens after the ack now has a route into the portfolio that does not
+   require an operator to resolve an `UNKNOWN`. Folded in with it:
+   `resolve_unknown` now takes the gateway lock, which it had been missing
+   despite being a fill-booking path (§7 item 8 below).
+3. **`PaperBroker.fetch_order_state`** — *not yet started.* The venue half:
+   `sync_order` can ask, but `PaperBroker` still derives its answer from what it
+   was told at placement, so a resting order cannot actually become a fill.
+
+No `amend` or `replace` exists anywhere under `trading/`. Nothing is
+half-finished; there is no work-in-progress to pick up beyond increment 3.
 
 ---
 
@@ -274,27 +289,27 @@ the traced function, and `trace` does **not** honour `# pragma: no cover`.
 
 `docs/SAFETY.md` §5 is the authoritative list of honest limitations. Read it. In
 addition, these are verified gaps in the current code — each was confirmed by
-reading the source at `3664991`, and each is Stage 2G territory:
+reading the source at `3664991`, and each is Stage 2G territory. Items 1, 2, 3
+and 8 have since been **closed**; they are kept here, struck through, because
+the reasoning in each is what the fix had to satisfy.
 
-1. **`gateway.cancel()` never changes the order state**
-   (`trading/core/gateway.py:610`). It authorizes, calls
-   `broker.cancel_order`, and audits — but the `Order` stays
-   ACCEPTED/PARTIALLY_FILLED. So it remains `is_open`, keeps consuming the
-   `max_open_orders` budget at `trading/core/risk.py:686`, and reconciliation
-   still believes it is live.
-2. **No path exists for a later fill to reach the portfolio.** The only route
-   from a venue-observed fill into the portfolio is operator `resolve_unknown`,
-   which requires the order to be UNKNOWN. A resting limit order cannot become a
-   fill. `docs/ARCHITECTURE.md` §8 names this as the Stage 2G seam and says
-   plainly that driving a resting order to a fill belongs in core, not in an
-   adapter.
-3. **Latent double-booking in `resolve_unknown`** (`trading/core/gateway.py:654`).
-   It applies `ack.filled_quantity` as an *increment*. `PARTIALLY_FILLED →
-   UNKNOWN` is a legal transition, so an order with prior fills that later
-   resolved would book the earlier fills twice. **Not reachable today** — the
-   only route to UNKNOWN is from PENDING_NEW inside `_execute` — but it becomes
-   reachable the moment a lifecycle sync can mark an open order UNKNOWN. Fix it
-   in the same change that introduces that capability.
+1. ~~**`gateway.cancel()` never changes the order state.**~~ **Closed by
+   `26625d1`.** It authorized, called `broker.cancel_order`, and audited — but
+   the `Order` stayed ACCEPTED/PARTIALLY_FILLED, so it kept consuming the
+   `max_open_orders` budget and reconciliation still believed it was live.
+   `cancel` now reads the venue's state afterwards and settles the order.
+2. ~~**No path exists for a later fill to reach the portfolio.**~~ **Closed by
+   `ExecutionGateway.sync_order`.** The only route from a venue-observed fill
+   into the portfolio used to be operator `resolve_unknown`, which requires the
+   order to be UNKNOWN. The core half is done; the venue half
+   (`PaperBroker.fetch_order_state`) is not, so a resting paper order still
+   cannot actually become a fill — see §3 increment 3.
+3. ~~**Latent double-booking in `resolve_unknown`.**~~ **Closed by `c5ff7a5`.**
+   It applied `ack.filled_quantity` as an *increment*, so an order with prior
+   fills that later resolved would have booked them twice. Both venue-state
+   paths now go through `_apply_fetched_state`, which treats the venue's answer
+   as a cumulative snapshot and applies only the delta — which is also what
+   makes a repeated `sync_order` free.
 4. **No amend / replace.** `OrderIntent` is frozen and content-addressed, so a
    changed quantity is a different idempotency key and therefore a different
    order. Cancel-then-resubmit through the full chain is the only path the
@@ -308,9 +323,13 @@ reading the source at `3664991`, and each is Stage 2G territory:
 7. **`Order.remaining_quantity` has no production consumers** outside its own
    definition. `OrderStore.open_orders()` is consumed at exactly one place,
    `trading/core/risk.py:686`.
-8. **`gateway._lock` is a plain non-reentrant `threading.Lock`.** `submit` takes
-   it; `cancel` and `resolve_unknown` do **not**. Any new lifecycle entry point
-   needs a deliberate decision here, and must not deadlock against `submit`.
+8. ~~**`gateway._lock` is a plain non-reentrant `threading.Lock`** that `cancel`
+   and `resolve_unknown` do not take.~~ **Closed.** All four public entry
+   points — `submit`, `cancel`, `sync_order`, `resolve_unknown` — now take it,
+   each via a thin `with self._lock:` wrapper around a `_*_locked` body, which
+   is what keeps the non-reentrant lock from being taken twice on one path.
+   Every path that can move the portfolio is serialised against every other,
+   so a `submit` weighing its limits cannot read a position mid-change.
 9. **No persistence.** Everything is in-memory; a restart loses all state.
    Stage 2H.
 10. **The paper fill is an optimistic estimate of a live fill, always.** No
@@ -318,51 +337,52 @@ reading the source at `3664991`, and each is Stage 2G territory:
     latency, no queue position, no uncertainty. That is a limitation of the
     approach and it is why the broker-sandbox step exists in the progression.
 
-### One documentation defect, left unfixed on purpose
+### One documentation defect, now fixed
 
-`docs/SAFETY.md` §7 rule 6 says **"1 155 tests in ~4 s"**. The real figure is
-1462 tests in ~3 s. This handoff does not touch production code or other docs,
-so the stale number is reported rather than silently corrected. Fix it in the
-next stage that legitimately edits `SAFETY.md`.
+`docs/SAFETY.md` §7 rule 6 said **"1 155 tests in ~4 s"** when this handoff was
+written, and the real figure was 1462. It was reported rather than silently
+corrected, because that handoff touched no production code or other docs. Stage
+2G edits `SAFETY.md` legitimately, so the number is now current there.
 
 ---
 
 ## 8. Tests and coverage
 
-Verified at `3664991` on 2026-08-25.
+Re-verified on 2026-09-21, after Stage 2G increments 1 and 2.
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
 
-Result: **`Ran 1462 tests in 3.335s` / `OK`.**
+Result: **`Ran 1540 tests in 2.175s` / `OK`.**
 
 Coverage, via the project's stdlib-`trace` script (the one embedded in
 `docs/ARCHITECTURE.md` §7 — use it, not an ad-hoc approximation):
 
-**TOTAL: 96.7% — 5992 statements, 199 missed.**
+**TOTAL: 96.8% — 6241 statements, 202 missed.**
 
 | Package | Statements | Missed |
 |---|---|---|
 | `trading/adapters` | 503 | 0 |
 | `trading/advisory` | 397 | 2 |
-| `trading/core` | 4216 | 172 |
+| `trading/core` | 4465 | 175 |
 | `trading/ports` | 137 | 14 |
 | `trading/strategy` | 737 | 11 |
 | `trading/__init__.py` | 2 | 0 |
 
 Least-covered files: `core/config.py` 86.5%, `ports/repository.py` 85.0%,
 `ports/broker.py` 88.9%, `core/money.py` 92.2%, `core/secrets.py` 92.2%,
-`core/sizing.py` 92.6%, `strategy/context.py` 93.6%, `core/gateway.py` 95.6%.
+`core/sizing.py` 92.6%, `strategy/context.py` 93.6%, `core/authz.py` 95.8%.
+`core/gateway.py` is at 97.1% and all seventeen of its misses predate Stage 2G.
 
 At 100%: all of `adapters/`, plus `core/clock.py`, `core/errors.py`,
 `core/marketdata.py`, `core/portfolio.py`, `strategy/base.py`,
 `strategy/indicators.py`, `strategy/sizing.py`.
 
-Size: 26 `test_*.py` files under `tests/`, plus `harness.py` and `__init__.py`
-(28 tracked Python files there); 40 production `.py` files under `trading/`,
-totalling 10907 lines. Largest: `core/risk.py` 752, `advisory/advisor.py` 707,
-`core/gateway.py` 684, `core/orders.py` 589, `core/money.py` 555,
+Size: 30 `test_*.py` files under `tests/`, plus `harness.py` and `__init__.py`
+(32 tracked Python files there); 40 production `.py` files under `trading/`,
+totalling 11460 lines. Largest: `core/gateway.py` 1139, `core/risk.py` 752,
+`advisory/advisor.py` 707, `core/orders.py` 687, `core/money.py` 555,
 `core/marketdata.py` 511, `core/portfolio.py` 493, `core/config.py` 456.
 
 `docs/ARCHITECTURE.md` §3 and §7 currently state these same figures and are
