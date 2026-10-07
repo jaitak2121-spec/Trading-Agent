@@ -37,7 +37,11 @@ from .errors import (
     SafetyViolation,
 )
 from .money import (
+    BTC,
     FINANCIAL_CONTEXT,
+    INR,
+    USD,
+    USDT,
     Currency,
     Money,
     Price,
@@ -47,6 +51,24 @@ from .money import (
 
 #: Prices carry up to this many decimal places; see :class:`~trading.core.money.Price`.
 _PRICE_SCALE: Final = 12
+
+#: The currencies a persisted limit price may name. Restricting to this registry
+#: means a corrupted or hand-edited store cannot smuggle in a currency code the
+#: running system does not know -- the restore either finds a real
+#: :class:`~trading.core.money.Currency` or refuses.
+_CURRENCIES: Final[Mapping[str, Currency]] = {
+    USD.code: USD,
+    INR.code: INR,
+    USDT.code: USDT,
+    BTC.code: BTC,
+}
+
+
+def _currency_by_code(code: object) -> Currency:
+    """Resolve a persisted currency code, or refuse an unknown one."""
+    if not isinstance(code, str) or code not in _CURRENCIES:
+        raise ValueError(f"unknown currency code {code!r} in persisted order")
+    return _CURRENCIES[code]
 
 __all__ = [
     "OrderSide",
@@ -629,6 +651,139 @@ class Order:
                 "created_at": self._created_at,
                 "updated_at": self._updated_at,
             }
+
+    # -- persistence -------------------------------------------------------
+    def to_dict(self) -> dict[str, object]:
+        """A complete, JSON-serialisable snapshot of the order's persisted state.
+
+        Every field a durable store must round-trip: the intent (from which the
+        idempotency key is re-derived), the state, the fill accumulation, the
+        venue binding, and the timestamps. The runtime ``_clock`` and ``_lock``
+        are *not* here -- they are process objects, re-attached on restore.
+
+        Money is written as exact decimal *strings* (INVARIANT 8). A float would
+        both round-trip inexactly and could not be read back without a
+        ``to_decimal`` rejection.
+        """
+        with self._lock:
+            intent = self._intent
+            return {
+                "order_id": self._order_id,
+                "state": self._state.value,
+                "filled_quantity": str(self._filled_quantity.amount),
+                "filled_asset": self._filled_quantity.asset,
+                "notional_total": str(self._notional_total),
+                "quote_currency": (
+                    self._quote_currency.code if self._quote_currency else None
+                ),
+                "broker_order_id": self._broker_order_id,
+                "created_at": self._created_at,
+                "updated_at": self._updated_at,
+                "intent": {
+                    "strategy_id": intent.strategy_id,
+                    "signal_id": intent.signal_id,
+                    "symbol": intent.symbol,
+                    "side": intent.side.value,
+                    "quantity": str(intent.quantity.amount),
+                    "asset": intent.quantity.asset,
+                    "order_type": intent.order_type.value,
+                    "limit_price": (
+                        str(intent.limit_price.amount) if intent.limit_price else None
+                    ),
+                    "limit_currency": (
+                        intent.limit_price.currency.code if intent.limit_price else None
+                    ),
+                },
+            }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object], *, clock: Clock) -> "Order":
+        """Rebuild an order from :meth:`to_dict` output, or refuse.
+
+        **This does not reopen the transition table.** A restored order cannot be
+        put into a state it could not have reached: the filled quantity is
+        rebuilt *through* ``apply_fill``, which enforces the same overfill,
+        asset, and progression rules a live fill would; the state is set from the
+        snapshot only after that, and only to a value the snapshot is allowed to
+        name. A corrupt or hand-edited store that claims ``FILLED`` with nothing
+        filled, or a fill larger than the order, raises rather than producing an
+        order that violates the invariants the live path maintains.
+
+        ``broker_order_id`` is set directly rather than through
+        ``attach_broker_order_id``: there is no prior binding to conflict with on
+        a fresh object, and the setter's rebinding guard exists to stop a *live*
+        order from being repointed, which cannot happen here.
+
+        Raises:
+            ValueError / TypeError / KeyError: the payload is not a coherent
+                order. Callers that read from disk surface this as a persistence
+                failure and fail closed.
+        """
+        order_id = payload["order_id"]
+        intent_payload = payload["intent"]
+        limit_price = intent_payload["limit_price"]
+        intent = OrderIntent(
+            strategy_id=intent_payload["strategy_id"],
+            signal_id=intent_payload["signal_id"],
+            symbol=intent_payload["symbol"],
+            side=OrderSide(intent_payload["side"]),
+            quantity=Quantity(intent_payload["quantity"], intent_payload["asset"]),
+            order_type=OrderType(intent_payload["order_type"]),
+            limit_price=(
+                Price(limit_price, _currency_by_code(intent_payload["limit_currency"]))
+                if limit_price is not None
+                else None
+            ),
+        )
+        order = cls(intent, clock=clock, order_id=str(order_id))
+
+        # Rebuild fills through apply_fill so the accumulation rules cannot be
+        # bypassed by a persisted value.
+        filled = Quantity(payload["filled_quantity"], payload["filled_asset"])
+        if not filled.is_zero:
+            if filled.asset != intent.quantity.asset:
+                raise ValueError(
+                    f"persisted filled asset {filled.asset} does not match order "
+                    f"asset {intent.quantity.asset}"
+                )
+            if filled > intent.quantity:
+                raise ValueError(
+                    f"persisted filled quantity {filled} exceeds ordered "
+                    f"{intent.quantity}"
+                )
+            quote_code = payload["quote_currency"]
+            if quote_code is None:
+                raise ValueError("a filled order must record its quote currency")
+            currency = _currency_by_code(quote_code)
+            with decimal.localcontext(FINANCIAL_CONTEXT):
+                unit_price = Decimal(str(payload["notional_total"])) / filled.amount
+            order.apply_fill(
+                filled,
+                Price.rounded(unit_price, currency, max_scale=_PRICE_SCALE),
+                reason="restored from durable store",
+                via_reconciliation=True,
+            )
+
+        target = OrderState(payload["state"])
+        if target is not order._state:
+            # Everything richer than the state apply_fill derived (PENDING_NEW,
+            # ACCEPTED, UNKNOWN, terminal-but-unfilled) is set directly. The
+            # fill-derived states are never *overridden* here -- apply_fill
+            # already produced FILLED / PARTIALLY_FILLED, and a snapshot that
+            # disagreed with the fills would have been refused above.
+            if target in (OrderState.FILLED, OrderState.PARTIALLY_FILLED):
+                raise ValueError(
+                    f"persisted state {target.value} disagrees with the recorded "
+                    f"fills ({filled}); refusing to restore an impossible order"
+                )
+            order._state = target
+
+        order._notional_total = Decimal(str(payload["notional_total"]))
+        order._created_at = str(payload["created_at"])
+        order._updated_at = str(payload["updated_at"])
+        broker_order_id = payload["broker_order_id"]
+        order._broker_order_id = None if broker_order_id is None else str(broker_order_id)
+        return order
 
     def __repr__(self) -> str:
         return (

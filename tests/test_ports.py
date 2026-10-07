@@ -26,28 +26,36 @@ from trading.adapters.memory import (
     SimulatedBroker,
     StaticMarketData,
 )
+from trading.adapters.recovery import RestartRecoveryCoordinator
 from trading.core.clock import ManualClock
+from trading.core.dedupe import ReservationStore
 from trading.core.money import USD, Price
 from trading.core.orders import OrderStore
 from trading.core.reconciliation import PositionLedger
 from trading.ports import (
+    BrokerOrderInventoryPort,
     BrokerPort,
     MarketDataPort,
     OrderRepositoryPort,
     PositionRepositoryPort,
     QuoteFeedPort,
+    ReservationRepositoryPort,
+    RestartRecoveryPort,
 )
 
-#: Every port, paired with the Stage 1 class that implements it. A port missing
-#: from this list is a port nothing is holding to account, which is the exact
+#: Every port, paired with the class that implements it. A port missing from
+#: this list is a port nothing is holding to account, which is the exact
 #: failure this module exists to prevent -- see
 #: ``test_every_port_has_an_implementation``.
 PORT_IMPLEMENTATIONS = [
     (OrderRepositoryPort, OrderStore),
     (PositionRepositoryPort, PositionLedger),
+    (ReservationRepositoryPort, ReservationStore),
     (BrokerPort, SimulatedBroker),
     (MarketDataPort, StaticMarketData),
     (QuoteFeedPort, InMemoryQuoteFeed),
+    (RestartRecoveryPort, RestartRecoveryCoordinator),
+    (BrokerOrderInventoryPort, SimulatedBroker),
 ]
 
 

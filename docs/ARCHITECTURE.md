@@ -87,6 +87,14 @@ other — `gateway.py` imports `ports.broker`, and `ports.repository` imports
 handed to the gateway at construction time as a `BrokerPort`; the kernel never
 knows which one it got.
 
+Not every adapter is a port implementation, though, and the diagram's
+"implemented by" arrow describes the common case rather than the rule.
+`trading.adapters.lifecycle` implements no port: it *calls* the gateway on a
+schedule. The import direction is unchanged — it still imports inward and
+nothing imports it — which is the property the layering actually turns on. It
+belongs here rather than in the kernel because it owns a thread and a schedule,
+and because the gateway is the only actor in `trading.core` (see §6).
+
 **Strategies import the kernel but cannot reach a venue.** `trading.strategy`
 may import `trading.core` and `trading.ports`, but no strategy module imports a
 concrete adapter or the gateway. `test_core_purity.py` checks both directly.
@@ -103,7 +111,7 @@ modules, the same way `trading.strategy`'s gateway ban already is.
 
 ## 3. Module inventory
 
-### `trading.core` — the safety kernel (4 216 statements)
+### `trading.core` — the safety kernel (4 504 statements)
 
 | Module | What it owns |
 |---|---|
@@ -129,13 +137,20 @@ modules, the same way `trading.strategy`'s gateway ban already is.
 `trading/core/__init__.py` re-exports nothing. Callers import from the specific
 module, so an import line says which control is in play.
 
-### `trading.ports` — interfaces only (137 statements)
+### `trading.ports` — interfaces only (190 statements)
 
 `BrokerPort`, `MarketDataPort`, `QuoteFeedPort`, `OrderRepositoryPort`,
-`PositionRepositoryPort`. Every one is abstract and every abstract method body is
-`...` or `pass` — `test_ports.py` asserts that by AST, so a port cannot quietly
-acquire logic. It also pairs every exported port with a concrete implementation,
-so a port nothing satisfies cannot be added.
+`PositionRepositoryPort`, and — added in Stage 2H — `ReservationRepositoryPort`
+and `RestartRecoveryPort`. Every one is abstract and every abstract method body
+is `...` or `pass` — `test_ports.py` asserts that by AST, so a port cannot
+quietly acquire logic. It also pairs every exported port with a concrete
+implementation, so a port nothing satisfies cannot be added.
+
+`ReservationRepositoryPort` is the seam that made Stage 2H possible without
+touching the gateway: `IdempotencyRegistry` used to own a dict, and now owns a
+repository. `RestartRecoveryPort` is deliberately a *port* rather than a
+coordinator baked into the kernel, because what a restart scan should do with an
+ambiguous order is an operations decision, not a kernel one.
 
 The repository ports declare their conformance with `ABCMeta.register()` rather
 than by inheritance:
@@ -156,23 +171,27 @@ not the whole guarantee. `test_ports.py` checks that every abstract method
 exists on each implementation *with a compatible signature* — strictly stronger
 than inheritance, which would notice a missing method but not a changed one.
 
-### `trading.adapters` — the only adapters (503 statements)
+### `trading.adapters` — the only adapters (799 statements)
 
-Two subpackages, deliberately opposite, both behind the one gateway.
+Two venues, deliberately opposite, both behind the one gateway — plus one
+driver, and Stage 2H's repositories and recovery coordinator.
 
-`trading.adapters.memory` (287 statements) is the **hostile** half:
+`trading.adapters.memory` (285 statements) is the **hostile** half:
 `SimulatedBroker`, `StaticMarketData`, `InMemoryQuoteFeed`. The broker can be
 scripted to reject, to answer `UNCERTAIN`, or to raise after the request has left;
 the quote feed can freeze, go dark, deliver ticks out of order, or stamp them in
 the future. The failure modes that matter are the ones that are hard to reach
 against a real venue.
 
-`trading.adapters.paper` (216 statements) is the **honest** half: `PaperBroker`
+`trading.adapters.paper` (225 statements) is the **honest** half: `PaperBroker`
 fills from the same `QuoteFeedPort` the rest of the system reads, crossing the
 side of the book the order actually crosses (a buy lifts the ask), applying
 `slippage_bps` against the order in both directions, capping each placement at
 the configured `depth` — which is where **partial fills** come from — and
-refusing rather than guessing when the quote is missing or stale. It never
+refusing rather than guessing when the quote is missing or stale. A limit the
+book has not reached rests, and `fetch_order_state` re-decides it against the
+*current* quote, so the limit the market later reaches fills on that poll — the
+same `_decide` the placement used, never a second fill model. It never
 answers `UNCERTAIN` and never raises, because a venue inside this process is
 never genuinely in doubt; that case belongs to the simulator and stays there.
 There is no `script` and no `raise_on_next`, and no fee field: cost is expressed
@@ -182,6 +201,78 @@ daily-loss limit ever read.
 A paper fill is still an optimistic estimate of a live one — nothing here models
 latency, queue position, or market impact. That is why the progression runs
 through a broker sandbox rather than from paper straight to live.
+
+`trading.adapters.lifecycle` (124 statements) is the **driver**, and the first
+thing in this repository that calls the kernel rather than being called by it —
+which is exactly why it is an adapter. `LifecyclePoller` sweeps
+`OrderStore.open_orders()` and hands each one to `ExecutionGateway.sync_order`
+under a `Principal` holding `Action.RECONCILE`; `start`/`stop` add a daemon
+thread that repeats the sweep on an interval. It holds no lifecycle opinion of
+its own: it does not decide what is pollable (`is_open` is exactly
+PENDING\_NEW / ACCEPTED / PARTIALLY\_FILLED, so terminal *and* UNKNOWN orders are
+excluded without this module naming a state), does not decide what is authorized,
+and does not interpret, book, or audit a venue answer — `sync_order` does all
+three under the gateway lock. Its report keeps `refused` (the gateway working)
+apart from `failed` (the venue or the wiring broken), because collapsing them
+would convert "we could not find out" into "nothing to worry about".
+`UnauthorizedAction` propagates out of the sweep rather than being recorded,
+since `authorize` refuses *without* auditing and a swallowed one would leave a
+misconfigured poller sweeping nothing forever with no trace.
+
+`trading.adapters.persistence` (113 statements) is **Stage 2H**, and the name
+overpromises twice.
+First, nothing here writes to a disk or a database — every implementation is a
+dict behind a lock. Second, only two of the three exports are actually adapters:
+
+```python
+# trading/adapters/persistence/__init__.py
+from .order_store import OrderStoreAdapter
+from .position_ledger import PositionLedgerAdapter as PositionLedger
+from .reservation_repository import ReservationRepository
+
+# The package-level name is the adapter implementation, not the core class.
+OrderStore = OrderStoreAdapter
+```
+
+All three names are classes defined in this package. `OrderStore` previously
+resolved to `trading.core.orders.OrderStore`, because `order_store.py` imported
+the core class under that name at module scope and the unaliased re-export picked
+up the import rather than the `OrderStoreAdapter` defined below it. That made the
+adapter unreachable from the package surface and uncalled by anything, and it
+scored 51.6% under `trace`.
+
+It is repaired: `order_store.py` imports the core class as `CoreOrderStore`,
+exports `OrderStoreAdapter`, and the package aliases `OrderStore` to it, so
+existing callers keep working while the name resolves to the adapter. The
+wrapped-store constructor now aliases the underlying `_lock` as well as `_by_id`
+and `_by_key`; it had aliased the dicts without the lock, so two wrappers around
+one store would have mutated shared dictionaries under different locks. The file
+is at 100% coverage. See `CLAUDE_HANDOFF.md` §7 item 11.
+
+What 2H does buy, and buys for all three entities, is the *injection*. Before it,
+`IdempotencyRegistry` owned a `dict` and `OrderStore` owned a `dict`, so there
+was no seam at which state could outlive the object holding it. Now the kernel
+holds a repository it was handed, and a restart means rebuilding the kernel
+around repositories that were *not* rebuilt. That is a weaker claim than
+durability and a strictly necessary step toward it: the question "does
+INVARIANT 5 survive a restart" can now be asked and answered without a database
+existing, and the answer is tested rather than assumed.
+
+`trading.adapters.recovery` (50 statements) is the operator's side of that.
+`RestartRecoveryCoordinator`
+implements `RestartRecoveryPort`: `scan()` reads the surviving repositories and
+classifies every order it finds — `UNKNOWN` is ambiguous because we never learned
+what the venue did, and `PENDING_NEW` with a `SUBMITTED` reservation is ambiguous
+because the order was handed over and the crash landed in the window where the
+answer would have arrived. Those two cases are the entire point of the module.
+
+`sync_order` and `resolve_unknown` on the coordinator are one-line delegations to
+the gateway, deliberately. The coordinator is allowed to *find* an ambiguous
+order; it is not allowed to decide what the order's state becomes, because that
+decision has to stay behind the gateway lock where the audit record, the
+reservation bookkeeping, and the position effect happen together (INVARIANT 13).
+A coordinator that applied venue state itself would be the second lifecycle
+interpretation this repository has refused to grow since Stage 2G.
 
 ### `trading.strategy` — proposals only (737 statements)
 
@@ -425,17 +516,18 @@ Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
 python3 -m unittest discover -s tests -t .
 ```
 
-1 540 tests, ~2 s, 96.8% statement coverage (6 241 statements, 202 missed).
+1 875 tests, ~2.5 s, 96.5% statement coverage (7 989 statements, 277 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
-| `test_paper_broker.py` | 112 | Fills at the crossed side, slippage against the order, partial fills, every refusal, and every gate still refusing with the paper venue behind it |
+| `test_paper_broker.py` | 143 | Fills at the crossed side, slippage against the order, partial fills, every refusal, a resting order re-decided against the current book, and every gate still refusing with the paper venue behind it |
 | `test_marketdata.py` | 95 | Quote/candle validation, staleness, the frozen-feed refusal |
 | `test_gateway.py` | 89 | Each gate's refusal, and the chain ordering |
+| `test_dedupe_reconciliation.py` | 85 | Idempotency keys, UNKNOWN, mismatch, staleness, and the reservation transition table — including that `UNKNOWN -> SETTLED` is refused |
 | `test_invariants_end_to_end.py` | 79 | All thirteen invariants on a wired system |
-| `test_dedupe_reconciliation.py` | 75 | Idempotency keys, UNKNOWN, mismatch, staleness |
 | `test_orders.py` | 75 | Order state machine, `OrderStore` |
 | `test_risk.py` | 75 | Every limit, and the reducing-order waiver |
+| `test_lifecycle_poller.py` | 71 | The sweep reaching the gateway, terminal orders never fetched, UNKNOWN still blocking, authorization preserved, a failed read never becoming a safe state, and start/stop with no duplicate workers |
 | `test_advisory.py` | 70 | Advice places nothing, blocks vs warnings, a refusal carries no size |
 | `test_signal_sizing.py` | 32 | A stopless signal refused, an unknowable loss budget refused, direction-to-side |
 | `test_signals.py` | 69 | Signal coherence, `MarketContext`, `SignalRunner`, the reference strategy |
@@ -455,10 +547,14 @@ python3 -m unittest discover -s tests -t .
 | `test_authz.py` | 34 | Role matrix, token single-use and TTL |
 | `test_modes.py` | 34 | Transition table |
 | `test_clock.py` | 33 | `SystemClock` and `ManualClock` |
+| `test_persistence.py` | 26 | The three repository adapters against their ports: round-trips, a rejected duplicate, `KeyError` on an absent id, and ten threads adding reservations without losing one |
 | `test_ports.py` | 22 | Ports abstract; implementations conform by signature |
 | `test_cancel.py` | 20 | The cancel/fill race, and which answer wins |
 | `test_lifecycle.py` | 16 | Cumulative-to-delta fills, and every refusal of a venue's answer |
+| `test_gateway_persistence.py` | 13 | The gateway reading and writing through injected repositories rather than its own dicts: order and reservation written together at submission, a rejected ack settling the reservation, an UNKNOWN reservation still blocking, and a rebuilt gateway seeing the surviving state |
+| `test_restart_recovery.py` | 12 | `RestartRecoveryCoordinator.scan` counting surviving orders, excluding terminal ones, reporting each ambiguous order in full, and an UNKNOWN still blocking after the scan — plus the two delegations the coordinator exposes |
 | `test_resolve_unknown.py` | 7 | Resolving UNKNOWN without double-booking a prior fill |
+| `test_restart_recovery_e2e.py` | 6 | A rebuilt stack on surviving repositories: an UNKNOWN still blocking, INVARIANT 12 still refusing a replay, the ledger agreeing with the venue (INVARIANT 6), and trading resuming only after an operator resolves |
 
 Coverage is measured with the stdlib `trace` module, since `coverage.py` would be
 a third-party dependency. Do **not** read the figure off `trace --summary`: its
@@ -485,15 +581,40 @@ print(f'TOTAL: {100*(total-missed)/total:.1f}%  ({total} statements, {missed} mi
 "
 ```
 
-The 202 missed statements are overwhelmingly unreachable-by-design: the `...`
-bodies of abstract port methods (all six misses in `ports/repository.py`), and
-defensive `raise TypeError` / `raise ConfigurationError` guards against argument
-types the surrounding code already prevents. A handful are unexercised `__repr__`
-and property accessors. Two are the `Advisor`'s refusal of an identity holding
-`EXECUTE_ORDER`, which no role holds together with `PROPOSE_ORDER` — the test
-asserts *that* property instead, since it is what would have to change for the
-tripwire to matter. Four statements carry `# pragma: no cover`; `trace` does
-not honour the pragma, so they are counted as missed here.
+The 277 missed statements are overwhelmingly unreachable-by-design: the `...`
+bodies of abstract port methods, and defensive `raise TypeError` /
+`raise ConfigurationError` guards against argument types the surrounding code
+already prevents. A handful are unexercised `__repr__` and property accessors.
+Two are the `Advisor`'s refusal of an identity holding `EXECUTE_ORDER`, which no
+role holds together with `PROPOSE_ORDER` — the test asserts *that* property
+instead, since it is what would have to change for the tripwire to matter. Four
+statements carry `# pragma: no cover`; `trace` does not honour the pragma, so
+they are counted as missed here.
+
+`adapters/sandbox/broker.py` is the largest single contributor to the rise since
+Stage 2H, and its misses are the same kind: field-reader guards for response
+shapes a well-formed venue would never send, and `TransportMalformed` branches
+that exist so an unreadable answer becomes uncertainty instead of an exception.
+They are the defensive half of "an answer that cannot be fully read is
+uncertain", and removing them to raise the figure would remove the property.
+
+`ports/broker.py` fell from 88.9% to 81.6% when `BrokerOrderInventoryPort` and
+`BrokerOrderSnapshot` landed. The misses are the new port's abstract-method body
+and the snapshot's validation guards — unreachable by the same argument as the
+`...` bodies above. Do not chase the percentage by deleting the guards; they are
+what refuses a malformed venue record at the boundary rather than three layers
+deeper.
+
+Nine are a different case, and the only one where the tool is wrong rather
+than the code unreachable: the body of `LifecyclePoller._run` runs on a worker
+thread, and `trace.Trace` does not follow threads it did not start, so its lines
+read as missed even though `test_lifecycle_poller.py` drives them. Re-running the
+identical measurement with `threading.settrace(tracer.globaltrace)` installed
+reports `trading/adapters/lifecycle.py` at 100.0% (124 statements, 0 missed).
+The canonical script above is left thread-blind on purpose — a per-file
+correction is not worth a second number to keep in step — but a future module
+with real work on a worker thread should expect the same shortfall and check it
+the same way rather than assume the lines are dead.
 
 `tests/harness.py` builds a fully wired system (`build_rig()`) with a
 `ManualClock`, an `InMemoryAuditSink`, and a `SimulatedBroker`. Prefer it to
@@ -509,9 +630,10 @@ Every seam is already named. Nothing in `trading.core` changes.
 
 | Addition | Attaches at | Notes |
 |---|---|---|
-| PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort` | The in-memory `OrderStore` and `PositionLedger` already satisfy both. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. |
+| PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort`, `ReservationRepositoryPort` | **Seam widened in Stage 2H.** All three ports now have in-memory implementations that the kernel is *injected* with rather than owning, so a database adapter is a fourth implementation and not a kernel change. Two warnings carry forward. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. And a real adapter must write `PENDING_NEW` *before* the order is sent: the in-memory stores satisfy that trivially because they have no commit step, which is exactly why they cannot prove a database adapter does. |
+| Restart recovery wiring | `RestartRecoveryPort` | **Landed, unwired.** `trading.adapters.recovery.RestartRecoveryCoordinator.scan()` reports ambiguous orders after a restart, and `sync_order` / `resolve_unknown` delegate to the gateway. Nothing calls `scan()` at startup, because there is still no startup — the same gap the lifecycle poller has, and for the same reason: see the FastAPI row. |
 | CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `PaperBroker` is the reference for the shape of an honest ack; `SimulatedBroker` is the reference for the failure modes a real client will actually hit. Unlike either, a network client *can* be genuinely in doubt, so it must answer `UNCERTAIN` rather than guess. |
-| Order lifecycle beyond the ack | `PaperBroker.fetch_order_state` | The core half exists: `ExecutionGateway.sync_order` asks the venue what a resting order has become and books the cumulative answer as a delta, so a fill discovered after the ack reaches the portfolio without an operator resolving an UNKNOWN. What is missing is a venue that can *have* such an answer — `PaperBroker` derives its reply from what it was told at placement, so a non-crossing limit rests and stays resting no matter how the market moves. Driving a resting order to a fill against the book is the adapter's half. |
+| Periodic lifecycle polling | `ExecutionGateway.sync_order` | **Landed.** `trading.adapters.lifecycle.LifecyclePoller` sweeps `open_orders()` and hands each one to `sync_order` under a `Principal` holding `Action.RECONCILE` — held by `Role.SYSTEM` for exactly this, so the poller needed no new permission. `poll_once()` is the whole behaviour and is synchronous; `start`/`stop` add only a daemon thread on an interval. Note that at the paper venue fill timing *is* poll timing, since nothing there advances on its own, so the interval is the fill granularity. What remains is *wiring*: nothing constructs a poller at startup, because there is no startup — see §8's FastAPI row. |
 | Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. An *advisory* endpoint calls `Advisor.advise` instead and needs no gateway at all — the two halves of the API are wired to different layers. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |

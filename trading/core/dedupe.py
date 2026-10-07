@@ -40,7 +40,7 @@ from .audit import AuditCategory, AuditLog, AuditOutcome
 from .clock import Clock
 from .errors import DuplicateOrderRejected, SafetyViolation
 
-__all__ = ["ReservationState", "Reservation", "IdempotencyRegistry"]
+__all__ = ["ReservationState", "Reservation", "ReservationStore", "IdempotencyRegistry"]
 
 
 class ReservationState(Enum):
@@ -88,13 +88,83 @@ class Reservation:
         }
 
 
-class IdempotencyRegistry:
-    """Thread-safe claim registry for idempotency keys."""
+class ReservationStore:
+    """In-memory reservation repository.
 
-    def __init__(self, audit: AuditLog, *, clock: Clock) -> None:
+    This is the default store used by IdempotencyRegistry when no external
+    repository is injected; it satisfies ReservationRepositoryPort.
+    """
+
+    def __init__(self) -> None:
+        self._reservations: dict[str, Reservation] = {}
+        self._lock = threading.RLock()
+
+    def add(self, reservation: Reservation) -> Reservation:
+        with self._lock:
+            if reservation.key in self._reservations:
+                raise ValueError(
+                    f"reservation for key {reservation.key[:16]}... already exists"
+                )
+            self._reservations[reservation.key] = reservation
+            return reservation
+
+    def get(self, key: str) -> Reservation | None:
+        with self._lock:
+            return self._reservations.get(key)
+
+    def update(self, reservation: Reservation) -> Reservation:
+        with self._lock:
+            if reservation.key not in self._reservations:
+                raise KeyError(f"no reservation for key {reservation.key[:16]}...")
+            self._reservations[reservation.key] = reservation
+            return reservation
+
+    def all_reservations(self) -> list[Reservation]:
+        with self._lock:
+            return list(self._reservations.values())
+
+    def unknown_reservations(self) -> list[Reservation]:
+        with self._lock:
+            return [
+                r for r in self._reservations.values()
+                if r.state is ReservationState.UNKNOWN
+            ]
+
+    def has_unknown(self) -> bool:
+        with self._lock:
+            return any(
+                r.state is ReservationState.UNKNOWN
+                for r in self._reservations.values()
+            )
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._reservations.pop(key, None)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._reservations)
+
+
+class IdempotencyRegistry:
+    """Thread-safe claim registry for idempotency keys.
+
+    Uses a ReservationRepositoryPort for persistence, which can be an
+    in-memory store or a persistent backend like PostgreSQL.
+    """
+
+    def __init__(
+        self,
+        audit: AuditLog,
+        *,
+        clock: Clock,
+        repository: "ReservationRepositoryPort | None" = None,
+    ) -> None:
         self._audit = audit
         self._clock = clock
-        self._reservations: dict[str, Reservation] = {}
+        if repository is None:
+            repository = ReservationStore()
+        self._repository = repository
         self._lock = threading.RLock()
 
     # -- claiming ----------------------------------------------------------
@@ -110,7 +180,7 @@ class IdempotencyRegistry:
             raise ValueError("order_id is required")
 
         with self._lock:
-            existing = self._reservations.get(key)
+            existing = self._repository.get(key)
             if existing is not None:
                 self._audit.record(
                     AuditCategory.ORDER,
@@ -137,7 +207,7 @@ class IdempotencyRegistry:
                 reserved_at=now,
                 updated_at=now,
             )
-            self._reservations[key] = reservation
+            self._repository.add(reservation)
             self._audit.record(
                 AuditCategory.ORDER,
                 "idempotency_key_reserved",
@@ -154,7 +224,7 @@ class IdempotencyRegistry:
         submission raises, because we cannot prove the venue never saw it.
         """
         with self._lock:
-            existing = self._reservations.get(key)
+            existing = self._repository.get(key)
             if existing is None:
                 raise KeyError(f"no reservation for key {key[:16]}...")
             if existing.state is not ReservationState.RESERVED:
@@ -175,7 +245,7 @@ class IdempotencyRegistry:
                     "request may have reached the venue. Freeing it would permit a "
                     "duplicate (INVARIANT 12)."
                 )
-            del self._reservations[key]
+            self._repository.delete(key)
             self._audit.record(
                 AuditCategory.ORDER,
                 "idempotency_key_released",
@@ -194,7 +264,7 @@ class IdempotencyRegistry:
         outcome: AuditOutcome,
     ) -> Reservation:
         with self._lock:
-            existing = self._reservations.get(key)
+            existing = self._repository.get(key)
             if existing is None:
                 raise KeyError(f"no reservation for key {key[:16]}...")
             if target is existing.state:
@@ -213,7 +283,7 @@ class IdempotencyRegistry:
                 updated_at=self._clock.now().isoformat(),
                 note=note,
             )
-            self._reservations[key] = updated
+            self._repository.update(updated)
             self._audit.record(
                 AuditCategory.ORDER,
                 event,
@@ -269,7 +339,7 @@ class IdempotencyRegistry:
         if not resolution or not resolution.strip():
             raise ValueError("resolving an UNKNOWN reservation requires a resolution")
         with self._lock:
-            existing = self._reservations.get(key)
+            existing = self._repository.get(key)
             if existing is None:
                 raise KeyError(f"no reservation for key {key[:16]}...")
             if existing.state is not ReservationState.UNKNOWN:
@@ -285,7 +355,7 @@ class IdempotencyRegistry:
                 updated_at=self._clock.now().isoformat(),
                 note=f"reconciled: {resolution}",
             )
-            self._reservations[key] = updated
+            self._repository.update(updated)
             self._audit.record(
                 AuditCategory.RECONCILIATION,
                 "idempotency_key_reconciled",
@@ -301,30 +371,24 @@ class IdempotencyRegistry:
 
     # -- queries -----------------------------------------------------------
     def get(self, key: str) -> Reservation | None:
-        with self._lock:
-            return self._reservations.get(key)
+        return self._repository.get(key)
 
     def is_claimed(self, key: str) -> bool:
-        with self._lock:
-            return key in self._reservations
+        return self._repository.get(key) is not None
 
     def unknown_reservations(self) -> list[Reservation]:
-        with self._lock:
-            return [
-                r for r in self._reservations.values()
-                if r.state is ReservationState.UNKNOWN
-            ]
+        return self._repository.unknown_reservations()
 
     def has_unknown(self) -> bool:
-        return bool(self.unknown_reservations())
+        return self._repository.has_unknown()
 
     def in_flight(self) -> list[Reservation]:
+        # in_flight returns RESERVED and SUBMITTED reservations
         with self._lock:
             return [
-                r for r in self._reservations.values()
+                r for r in self._repository.all_reservations()
                 if r.state in (ReservationState.RESERVED, ReservationState.SUBMITTED)
             ]
 
     def __len__(self) -> int:
-        with self._lock:
-            return len(self._reservations)
+        return len(self._repository.all_reservations())

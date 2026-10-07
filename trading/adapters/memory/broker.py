@@ -28,7 +28,15 @@ from ...core.authz import ExecutionToken
 from ...core.clock import Clock
 from ...core.money import Price, Quantity
 from ...core.orders import Order, OrderSide
-from ...ports.broker import AckOutcome, BrokerAck, BrokerPort, BrokerPositionSnapshot
+from ...ports.broker import (
+    AckOutcome,
+    BrokerAck,
+    BrokerOrderInventoryPort,
+    BrokerOrderSnapshot,
+    BrokerOrderStatus,
+    BrokerPort,
+    BrokerPositionSnapshot,
+)
 
 __all__ = ["BrokerFailure", "ScriptedAck", "SimulatedBroker"]
 
@@ -50,7 +58,7 @@ class ScriptedAck:
     lands_at_venue: bool = False
 
 
-class SimulatedBroker(BrokerPort):
+class SimulatedBroker(BrokerPort, BrokerOrderInventoryPort):
     """An in-process venue. No network, no credentials, no clock of its own."""
 
     def __init__(
@@ -79,6 +87,7 @@ class SimulatedBroker(BrokerPort):
         self._duplicate_keys: set[str] = set()
         # What the venue believes exists, keyed by idempotency key.
         self._venue_orders: dict[str, BrokerAck] = {}
+        self._venue_order_orders: dict[str, Order] = {}
         self._venue_positions: dict[str, Quantity] = {}
 
     # -- test controls ----------------------------------------------------
@@ -107,6 +116,24 @@ class SimulatedBroker(BrokerPort):
             raise TypeError("price must be a Price")
         with self._lock:
             self._fill_prices[symbol] = price
+
+    def plant_order_at_venue(self, order: Order, ack: BrokerAck) -> None:
+        """Put an order at the venue with no local counterpart.
+
+        Models the genuinely invisible case: a crash between the venue accepting
+        an order and our persisting it, or a placement made out of band. There is
+        no local record to ask about, so only a venue-wide inventory read can
+        find it -- which is the whole reason that capability exists.
+        """
+        if not isinstance(ack, BrokerAck):
+            raise TypeError("plant_order_at_venue takes a BrokerAck")
+        self._record_at_venue(order, ack)
+
+    def remove_order_at_venue(self, idempotency_key: str) -> None:
+        """Drop a venue record, as a lost or purged order would appear to us."""
+        with self._lock:
+            self._venue_orders.pop(idempotency_key, None)
+            self._venue_order_orders.pop(idempotency_key, None)
 
     # -- observations -----------------------------------------------------
 
@@ -190,6 +217,18 @@ class SimulatedBroker(BrokerPort):
             )
         return resting
 
+    def fetch_order_inventory(self) -> tuple[BrokerOrderSnapshot, ...]:
+        """Return a stable copy of the venue's records without changing them."""
+        with self._lock:
+            records = tuple(self._venue_orders.items())
+        snapshots: list[BrokerOrderSnapshot] = []
+        for key, ack in records:
+            order = self._order_for_key(key)
+            if order is None:
+                continue
+            snapshots.append(_snapshot_for(order, ack))
+        return tuple(snapshots)
+
     def fetch_positions(self) -> BrokerPositionSnapshot:
         with self._lock:
             return BrokerPositionSnapshot(dict(self._venue_positions))
@@ -231,6 +270,7 @@ class SimulatedBroker(BrokerPort):
             )
         with self._lock:
             self._venue_orders[order.idempotency_key] = stored
+            self._venue_order_orders[order.idempotency_key] = order
         if stored.outcome is AckOutcome.FILLED and stored.filled_quantity is not None:
             self._apply_venue_fill(order.symbol, order.side, stored.filled_quantity)
 
@@ -248,3 +288,42 @@ class SimulatedBroker(BrokerPort):
         with self._lock:
             self._seq += 1
             return f"SIM-{self._seq:06d}"
+
+    def _order_for_key(self, idempotency_key: str) -> Order | None:
+        with self._lock:
+            return self._venue_order_orders.get(idempotency_key)
+
+
+def _snapshot_for(order: Order, ack: BrokerAck) -> BrokerOrderSnapshot:
+    """Turn one venue record into a validated inventory snapshot.
+
+    The venue's own ack is the source: ``ACCEPTED`` means the venue is holding
+    a live order, ``FILLED`` means it traded, and anything else it disowned. A
+    scripted ``FILLED`` for less than the ordered size is a partial, which is a
+    distinct status in the snapshot even though ``BrokerAck`` has no word for it
+    -- the ack reports one trade, the snapshot reports the order's whole life.
+    """
+    status = {
+        AckOutcome.ACCEPTED: BrokerOrderStatus.OPEN,
+        AckOutcome.FILLED: BrokerOrderStatus.FILLED,
+        AckOutcome.REJECTED: BrokerOrderStatus.REJECTED,
+        AckOutcome.UNCERTAIN: BrokerOrderStatus.UNCERTAIN,
+    }.get(ack.outcome, BrokerOrderStatus.UNCERTAIN)
+    asset = order.intent.quantity.asset
+    filled = (
+        ack.filled_quantity
+        if ack.filled_quantity is not None
+        else Quantity.zero(asset)
+    )
+    if status is BrokerOrderStatus.FILLED and filled.amount < order.intent.quantity.amount:
+        status = BrokerOrderStatus.PARTIALLY_FILLED
+    return BrokerOrderSnapshot(
+        broker_order_id=ack.broker_order_id or order.order_id,
+        symbol=order.symbol,
+        side=order.side.value,
+        ordered_quantity=order.intent.quantity,
+        filled_quantity=filled,
+        status=status,
+        idempotency_key=order.idempotency_key,
+        fill_price=ack.fill_price,
+    )
