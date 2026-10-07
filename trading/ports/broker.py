@@ -31,6 +31,9 @@ from ..core.orders import Order
 __all__ = [
     "AckOutcome",
     "BrokerAck",
+    "BrokerOrderInventoryPort",
+    "BrokerOrderSnapshot",
+    "BrokerOrderStatus",
     "BrokerPositionSnapshot",
     "BrokerPort",
 ]
@@ -48,6 +51,66 @@ class AckOutcome(Enum):
     #: We do not know whether the venue received it. Never retry on this;
     #: reconcile (INVARIANT 5, INVARIANT 12).
     UNCERTAIN = "uncertain"
+
+
+class BrokerOrderStatus(Enum):
+    """Lifecycle state in a venue-wide order inventory snapshot."""
+
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerOrderSnapshot:
+    """Validated, cumulative observation of one venue order."""
+
+    broker_order_id: str
+    symbol: str
+    side: str
+    ordered_quantity: Quantity
+    filled_quantity: Quantity
+    status: BrokerOrderStatus
+    idempotency_key: str | None = None
+    fill_price: Price | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.broker_order_id, str) or not self.broker_order_id.strip():
+            raise ValueError("broker_order_id must be a non-empty string")
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if self.side not in {"buy", "sell"}:
+            raise ValueError("side must be 'buy' or 'sell'")
+        if not isinstance(self.ordered_quantity, Quantity) or not self.ordered_quantity.is_positive:
+            raise ValueError("ordered_quantity must be a positive Quantity")
+        if not isinstance(self.filled_quantity, Quantity):
+            raise TypeError("filled_quantity must be a Quantity")
+        if self.filled_quantity.amount < 0:
+            raise ValueError("filled_quantity must not be negative")
+        if self.filled_quantity.asset != self.ordered_quantity.asset:
+            raise ValueError("filled_quantity asset must match ordered_quantity")
+        if self.filled_quantity > self.ordered_quantity:
+            raise ValueError("filled_quantity must not exceed ordered_quantity")
+        if not isinstance(self.status, BrokerOrderStatus):
+            raise TypeError("status must be a BrokerOrderStatus")
+        if self.idempotency_key is not None and (
+            not isinstance(self.idempotency_key, str) or not self.idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must be non-empty when supplied")
+        if self.fill_price is not None and not isinstance(self.fill_price, Price):
+            raise TypeError("fill_price must be a Price")
+        if self.status is BrokerOrderStatus.FILLED and (
+            self.filled_quantity != self.ordered_quantity or self.fill_price is None
+        ):
+            raise ValueError("FILLED snapshot must be fully filled and priced")
+        if self.status is BrokerOrderStatus.PARTIALLY_FILLED and (
+            self.filled_quantity.is_zero or self.filled_quantity == self.ordered_quantity
+        ):
+            raise ValueError("PARTIALLY_FILLED snapshot must be between zero and full")
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,3 +201,30 @@ class BrokerPort(ABC):
     @abstractmethod
     def fetch_positions(self) -> BrokerPositionSnapshot:
         """The venue's view of positions, for reconciliation."""
+
+
+class BrokerOrderInventoryPort(ABC):
+    """A venue that can describe *every* order it holds, not just the ones we ask about.
+
+    :meth:`BrokerPort.fetch_order_state` answers about an order we already know
+    of, which means it can never reveal an order we have no local record of --
+    a ghost, or one placed out of band. Detecting those needs the venue to
+    enumerate its own book, and this is that capability.
+
+    Deliberately separate from :class:`BrokerPort` rather than a method on it,
+    for two reasons. It is a capability, not a requirement: a venue adapter with
+    no list endpoint is still a perfectly usable broker, and forcing every
+    implementation to grow a method it cannot honour would push adapters toward
+    inventing an answer. And it is checkable at the type level, so a
+    reconciliation coordinator can ask whether the venue supports a *complete*
+    sweep and block when it does not, instead of discovering the gap mid-sweep.
+
+    Implementations must be observation-only. A read here must not fill, cancel,
+    re-decide, or otherwise change what the venue holds: reconciliation compares
+    two readings of the world, and a read that changed one of them would compare
+    a reading against itself.
+    """
+
+    @abstractmethod
+    def fetch_order_inventory(self) -> tuple["BrokerOrderSnapshot", ...]:
+        """Every order the venue currently holds, as validated snapshots."""

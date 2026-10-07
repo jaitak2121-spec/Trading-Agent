@@ -25,11 +25,19 @@ can take. An order larger than the cap fills for the cap and leaves the rest
 unfilled -- which is the outcome the order-lifecycle work needs and which nothing
 in this repository produced before.
 
-**A limit order that does not cross.** It rests, and
-:meth:`fetch_order_state` reports it resting. It does not fill later on its own:
-there is no path today for a fill discovered outside ``place_order`` to reach the
-portfolio except operator reconciliation, and inventing one here would be an
-order-lifecycle change made in an adapter.
+**A limit order that does not cross.** It rests, and :meth:`fetch_order_state`
+reports it resting. Asking again later re-evaluates it against the *current*
+quote, so a limit the market subsequently reaches fills on the next poll --
+which is how a paper fill that happens after the acknowledgement reaches the
+portfolio at all. The re-evaluation is the same :meth:`_decide` the placement
+used, not a second fill model: a venue with two ways of pricing the same order
+would eventually give two different answers.
+
+An order fills at most once here, whether at placement or at a later poll. A
+partial fill's remainder is not topped up, because ``depth`` is the size
+available to one placement rather than a depleting pool -- re-offering it on
+every poll would make the quantity filled a function of how often someone asks,
+which is a worse lie than not modelling replenishment at all.
 
 **A missing or stale quote.** Both are refusals, never a guess. A paper venue
 that fills off a frozen feed reports profits that could not have been earned, so
@@ -47,7 +55,9 @@ What it deliberately does not model
 * **Market impact.** ``depth`` is the size available to one placement, not a
   depleting pool. A venue whose book thins as you trade it is an impact model,
   and an impact model that is wrong is more misleading than none.
-* **Latency, queue position, and time priority.** Everything is instantaneous.
+* **Latency, queue position, and time priority.** Everything is instantaneous,
+  and a resting order is re-evaluated only when someone asks about it. Nothing
+  here advances on its own, so the poll is what moves a resting order forward.
 * **Uncertainty.** See :mod:`trading.adapters.paper`.
 
 A paper fill is therefore an optimistic estimate of a live fill, always. That is
@@ -67,7 +77,15 @@ from ...core.clock import Clock
 from ...core.marketdata import Quote, StalenessPolicy
 from ...core.money import FINANCIAL_CONTEXT, Price, Quantity
 from ...core.orders import Order, OrderSide, OrderType
-from ...ports.broker import AckOutcome, BrokerAck, BrokerPort, BrokerPositionSnapshot
+from ...ports.broker import (
+    AckOutcome,
+    BrokerAck,
+    BrokerOrderInventoryPort,
+    BrokerOrderSnapshot,
+    BrokerOrderStatus,
+    BrokerPort,
+    BrokerPositionSnapshot,
+)
 from ...ports.market_data import QuoteFeedPort
 
 __all__ = ["PaperBroker", "PaperReject"]
@@ -94,7 +112,7 @@ class PaperReject:
     NO_LIQUIDITY = "no_liquidity"
 
 
-class PaperBroker(BrokerPort):
+class PaperBroker(BrokerPort, BrokerOrderInventoryPort):
     """An in-process venue that fills from a quote feed. No network, no credentials."""
 
     def __init__(
@@ -142,6 +160,7 @@ class PaperBroker(BrokerPort):
         self._duplicate_keys: set[str] = set()
         # What the venue holds, keyed by idempotency key, plus its own positions.
         self._acks: dict[str, BrokerAck] = {}
+        self._order_objects: dict[str, Order] = {}  # idempotency_key -> Order
         self._positions: dict[str, Quantity] = {}
 
     # -- configuration ----------------------------------------------------
@@ -209,6 +228,7 @@ class PaperBroker(BrokerPort):
             self._key_counts[key] = seen
             if seen > 1:
                 self._duplicate_keys.add(key)
+            self._order_objects[key] = order
 
             ack = self._decide(order)
             self._apply(order, ack)
@@ -245,33 +265,96 @@ class PaperBroker(BrokerPort):
             )
 
     def fetch_order_state(self, order: Order) -> BrokerAck:
-        """What the venue holds for this order.
+        """What the venue holds for this order, re-evaluated against the book.
 
         A venue with no record reports ``REJECTED``: the order does not exist, so
         treating it as never having happened is the honest reading. Worded and
         shaped exactly as the simulator's answer, because
         :meth:`~trading.core.gateway.ExecutionGateway.resolve_unknown` reads both.
+
+        A record that is *resting* is reconsidered here rather than replayed. The
+        market has moved since the placement, and a limit the book has since
+        reached would have traded at a real venue; reporting it resting forever
+        is what made a paper track record unable to contain a fill that happened
+        after the acknowledgement. This is therefore a read that can change what
+        the venue holds -- nothing in this process fills in the background, so
+        asking is what moves a resting order forward.
+
+        Once it has filled, the stored ack is what every later call returns. That
+        is what makes the answer a stable cumulative snapshot, which is what
+        :meth:`~trading.core.gateway.ExecutionGateway.sync_order` needs in order
+        to book a delta of zero when nothing has changed.
         """
         with self._lock:
             held = self._acks.get(order.idempotency_key)
-        if held is None:
-            return BrokerAck(
-                AckOutcome.REJECTED, message="venue has no record of this order"
-            )
-        return held
+            if held is None:
+                return BrokerAck(
+                    AckOutcome.REJECTED, message="venue has no record of this order"
+                )
+            if held.outcome is not AckOutcome.ACCEPTED:
+                # A fill is history. Re-deciding it would either re-offer depth
+                # that one placement already consumed or re-price a trade that
+                # has already happened.
+                return held
+            return self._reconsider(order, held)
 
     def fetch_positions(self) -> BrokerPositionSnapshot:
         with self._lock:
             return BrokerPositionSnapshot(dict(self._positions))
 
+    def fetch_order_inventory(self) -> tuple[BrokerOrderSnapshot, ...]:
+        """Read-only snapshot of all venue records. Does not re-decide resting orders."""
+        with self._lock:
+            acks_copy = dict(self._acks)
+            order_map = dict(self._order_objects)
+        snapshots = []
+        for key, ack in acks_copy.items():
+            order = order_map.get(key)
+            if order is None:
+                continue
+            snapshots.append(_paper_snapshot_for(order, ack))
+        return tuple(snapshots)
+
     # -- the fill model ---------------------------------------------------
 
-    def _decide(self, order: Order) -> BrokerAck:
+    def _reconsider(self, order: Order, held: BrokerAck) -> BrokerAck:
+        """Re-run the fill model on a resting order. Called with the lock held.
+
+        The only transition available here is resting to filled. Everything else
+        -- a limit the book still has not reached, a book with no depth, a quote
+        that has gone missing or stale -- returns the record unchanged, because
+        none of those mean the order is gone. Reporting a rejection instead would
+        put a *live* resting order into a terminal state at the first hiccup in
+        the feed, and the gateway would believe it, since a venue disowning an
+        order is exactly the answer it must be able to act on.
+
+        The stored acknowledgement is returned verbatim rather than a freshly
+        worded one: the venue's record has not changed, and a message that
+        drifted from poll to poll would suggest in the audit trail that something
+        had happened.
+
+        The fill reuses ``held.broker_order_id``. The gateway attached that
+        identifier when the order was accepted, and an answer bearing a different
+        one is a contradiction it refuses outright -- correctly, since at a real
+        venue it would mean the answer was about somebody else's order.
+        """
+        decided = self._decide(order, identity=held.broker_order_id)
+        if decided.outcome is not AckOutcome.FILLED:
+            return held
+        self._apply(order, decided)
+        return decided
+
+    def _decide(self, order: Order, *, identity: str | None = None) -> BrokerAck:
         """Everything the venue knows, turned into one definitive ack.
 
         Never ``UNCERTAIN`` and never an exception: a venue in this process knows
         what it did, and claiming otherwise would put the whole system into the
         UNKNOWN state over a local arithmetic problem.
+
+        ``identity`` supplies the ``broker_order_id`` for a re-evaluation instead
+        of minting a new one. It also keeps the sequence contiguous: polling a
+        resting order must not burn identifiers, or the numbering would record
+        how often someone looked rather than how many orders arrived.
         """
         now = self._clock.now()
         quote = self._quotes.quote(order.symbol)
@@ -298,7 +381,8 @@ class PaperBroker(BrokerPort):
                 )
             if not _crosses(executable, limit, order.side):
                 return self._resting(
-                    f"limit {limit.amount} not reached by {executable.amount}"
+                    f"limit {limit.amount} not reached by {executable.amount}",
+                    identity,
                 )
 
         ordered = order.intent.quantity
@@ -318,12 +402,12 @@ class PaperBroker(BrokerPort):
                     PaperReject.NO_LIQUIDITY,
                     f"no depth available in {order.symbol} for a market order",
                 )
-            return self._resting(f"no depth available in {order.symbol}")
+            return self._resting(f"no depth available in {order.symbol}", identity)
 
         partial = "" if fillable == ordered else f"partial fill: {fillable} of {ordered}"
         return BrokerAck(
             AckOutcome.FILLED,
-            broker_order_id=self._next_id(),
+            broker_order_id=identity if identity is not None else self._next_id(),
             filled_quantity=fillable,
             fill_price=executable,
             message=partial,
@@ -346,10 +430,10 @@ class PaperBroker(BrokerPort):
             )
             return Price.rounded(base.amount * factor, base.currency)
 
-    def _resting(self, detail: str) -> BrokerAck:
+    def _resting(self, detail: str, identity: str | None = None) -> BrokerAck:
         return BrokerAck(
             AckOutcome.ACCEPTED,
-            broker_order_id=self._next_id(),
+            broker_order_id=identity if identity is not None else self._next_id(),
             message=f"resting: {detail}",
         )
 
@@ -399,3 +483,29 @@ def _require_depth(symbol: str, available: object) -> None:
         )
     if available.amount < 0:
         raise ValueError(f"depth for {symbol} must not be negative, got {available}")
+
+
+def _paper_snapshot_for(order: Order, ack: BrokerAck) -> BrokerOrderSnapshot:
+    """Build a validated inventory snapshot from a PaperBroker venue record."""
+    _status_map = {
+        AckOutcome.ACCEPTED: BrokerOrderStatus.OPEN,
+        AckOutcome.FILLED: BrokerOrderStatus.FILLED,
+        AckOutcome.REJECTED: BrokerOrderStatus.REJECTED,
+        AckOutcome.UNCERTAIN: BrokerOrderStatus.UNCERTAIN,
+    }
+    status = _status_map.get(ack.outcome, BrokerOrderStatus.UNCERTAIN)
+    asset = order.intent.quantity.asset
+    filled = ack.filled_quantity if ack.filled_quantity is not None else Quantity.zero(asset)
+    # A partial fill: any FILLED ack where filled < ordered
+    if status is BrokerOrderStatus.FILLED and filled < order.intent.quantity:
+        status = BrokerOrderStatus.PARTIALLY_FILLED
+    return BrokerOrderSnapshot(
+        broker_order_id=ack.broker_order_id or order.order_id,
+        symbol=order.symbol,
+        side=order.side.value,
+        ordered_quantity=order.intent.quantity,
+        filled_quantity=filled,
+        status=status,
+        idempotency_key=order.idempotency_key,
+        fill_price=ack.fill_price,
+    )

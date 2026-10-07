@@ -242,6 +242,16 @@ path that lets a retry reuse a key whose request may have reached the venue.
 A key in `UNKNOWN` blocks the whole registry via `has_unknown()`, which the
 gateway consults before accepting anything new.
 
+Since Stage 2H the registry does not own the reservations; it reads and writes
+them through a `ReservationRepositoryPort`. The state machine above is unchanged
+— the repository stores a `Reservation`, it does not decide what a `Reservation`
+may become next. The reason the indirection exists is that the asymmetry is only
+worth anything if it outlives a restart: a key that was `SUBMITTED` before a
+crash must still be unfreeable afterwards, or the first retry after a restart is
+the duplicate the invariant was written to prevent. Today the repository is
+in-memory, so this holds across a rebuilt stack and **not** across a real process
+exit — see "What this does *not* protect against".
+
 ### Trading modes (INVARIANT 11)
 
 `ALLOWED_TRANSITIONS` is the complete table; anything absent is forbidden.
@@ -438,10 +448,31 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   those positions — `Position.basis_is_known` is the flag to check before
   believing a P&L number. Equity is unaffected, since it needs marks, not basis.
 - **Anything requiring a process boundary** — see capability isolation above.
-- **Persistence.** No state survives process exit: no orders, no positions, no
-  audit trail, no idempotency keys. A restart after an `UNKNOWN` order loses the
-  block that `UNKNOWN` was providing. This is the single largest gap, and it is
-  why `OrderRepositoryPort` and `PositionRepositoryPort` exist as seams.
+- **Durability.** *(Stage 2H, seam built, durability not.)* No state survives
+  **process** exit: no orders, no positions, no audit trail, no idempotency keys.
+  Stage 2H did not change that, and the package named
+  `trading.adapters.persistence` does not either — every implementation in it is
+  a dict behind a lock. What 2H built is the *injection*: the kernel is handed
+  `OrderStore`, `PositionLedger`, and `ReservationRepository` rather than owning
+  them, so state can now outlive the objects that read it even though it cannot
+  yet outlive the process. The practical difference is that the restart question
+  is now testable — `tests/test_restart_recovery_e2e.py` rebuilds the entire
+  stack around surviving repositories and asserts that INVARIANT 5's block and
+  INVARIANT 12's duplicate refusal both hold across the boundary. Read that as
+  evidence about the *wiring*, not about the disk. **A real crash still loses
+  everything, and a crash after an `UNKNOWN` order still loses the block that
+  `UNKNOWN` was providing.** This remains the single largest gap, and closing it
+  needs a repository implementation that writes `PENDING_NEW` before the order is
+  sent — see `trading/ports/repository.py` for why that ordering is the whole
+  problem.
+- **Recovery that runs by itself.** *(Stage 2H.)*
+  `RestartRecoveryCoordinator.scan()` will tell an operator which orders are
+  ambiguous after a restart — `UNKNOWN`, or `PENDING_NEW` with a `SUBMITTED`
+  reservation — but nothing calls it, because there is no startup sequence to
+  call it from. Recovery is therefore a capability, not a behaviour. Note that
+  this is the safe failure: an unscanned `UNKNOWN` order still blocks every new
+  submission through the reconciliation gate, so the consequence of nobody
+  running recovery is that trading stays stopped, not that it resumes blind.
 - **Concurrency across processes.** Within one process every mutable control
   holds a `threading.Lock` (fourteen of the eighteen core modules; the other
   four — `config`, `errors`, `money`, `sizing` — are immutable value types, the
@@ -466,6 +497,17 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   therefore the daily-loss limit read. A separate fee field would be money no
   risk control could see. This is why a broker sandbox sits between paper and
   live, and it is not optional.
+- **Paper fill *timing* is poll timing.** A resting paper order is re-decided
+  only when `fetch_order_state` asks about it, because nothing in this process
+  advances on its own. It then fills against whatever the book says at that
+  moment. So the venue answers "would this have filled by now?" and never "when
+  did it fill?", and it gets the first question right only as often as something
+  asks. `LifecyclePoller` is now what asks, on its interval — which makes that
+  interval the fill granularity, and a longer one a coarser record. Treat a paper
+  fill time as the time it was noticed, never as the time it happened, and do not
+  measure time-to-fill on paper at all. Queue position and time priority are the
+  parts of that question this venue does not model, and a real venue's answer
+  would be worse, never better.
 - **The venue lying.** Reconciliation compares our ledger against what the broker
   *reports*. A venue reporting incorrect positions produces a mismatch that
   cannot be resolved by asking it again.
@@ -525,6 +567,37 @@ network blip would hide the difference.
 ack = gateway.sync_order(order, operator=operator)   # order.state is the answer
 ```
 
+Against `PaperBroker` specifically, this call is also what *causes* the fill:
+that venue re-decides a resting order when asked, so "sync" and "advance" are
+the same act there. Nothing has happened at the venue between polls that the
+poll did not do. A real venue fills on its own schedule and the sync only
+discovers it; do not carry the paper intuition across.
+
+**Sync every open order on a schedule.** `LifecyclePoller` does the above to each
+order `OrderStore.open_orders()` offers, repeatedly, so a fill discovered after
+the ack arrives without anyone asking. It is a driver and adds no authority of
+its own: same `sync_order`, same `RECONCILE` check inside the gateway, same
+refusals, same audit records. `Role.SYSTEM` holds `RECONCILE` so an unattended
+poller needs no operator identity.
+
+```python
+poller = LifecyclePoller(gateway=gateway, orders=orders, identity=system,
+                         interval_seconds=5.0)
+report = poller.poll_once()      # one sweep, synchronous, no thread
+poller.start(); ...; poller.stop()   # the same sweep on an interval
+```
+
+Four properties matter for safety. It cannot reach a terminal or `UNKNOWN`
+order, because `is_open` excludes both and the poller selects on nothing else —
+so INVARIANT 5's block survives a poller running through it. A per-order refusal
+is recorded and the sweep continues; a failed venue read is recorded *separately*
+and the order is left exactly as it was, never marked `UNKNOWN` and never treated
+as finished, because "we could not find out" must not become "nothing to worry
+about". An `UnauthorizedAction` stops the worker instead of being swallowed,
+since `authorize` refuses without auditing and a misconfigured poller would
+otherwise sweep nothing forever, silently. And a second `start()` raises rather
+than quietly running two workers — harmless to the ledger, but a wiring bug.
+
 **Resolve an UNKNOWN order.** The only exit from `UNKNOWN` is asking the venue.
 Time does not clear it: a day of waiting leaves the block in place. Distinct
 from `sync_order`, which refuses an `UNKNOWN` order: leaving that state is a
@@ -581,8 +654,8 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 540
-   tests in ~2 s. There is no reason to run a subset.
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 875
+   tests in ~2.5 s. There is no reason to run a subset.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and
 for the seams a later stage attaches to.

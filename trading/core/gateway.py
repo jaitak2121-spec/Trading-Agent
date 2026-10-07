@@ -76,7 +76,7 @@ from .breaker import BreakerRegistry
 from .clock import Clock
 from .config import TradingConfig
 from .dedupe import IdempotencyRegistry, ReservationState
-from .errors import SafetyViolation, UnauthorizedAction
+from .errors import SafetyViolation, UnauthorizedAction, UnknownOrderStateBlocked
 from .killswitch import KillSwitch
 from .modes import TradingModeMachine
 from .money import FINANCIAL_CONTEXT, Price
@@ -355,6 +355,7 @@ class ExecutionGateway:
             #    positions must agree with the venue's.
             try:
                 self._reconciliation.require_clean(live=mode.is_live)
+                self._require_no_unknown_reservation()
             except SafetyViolation as exc:
                 return self._refuse(
                     ExecutionGate.RECONCILIATION, exc, intent, release_key=True
@@ -391,6 +392,31 @@ class ExecutionGateway:
             raise
 
     # -- steps 9 and 10 ---------------------------------------------------
+
+    def _require_no_unknown_reservation(self) -> None:
+        """Block new orders while any idempotency reservation is UNKNOWN.
+
+        This is a fail-closed backstop to ``require_clean``, which sources the
+        UNKNOWN block from the *order* store. In the default in-memory wiring the
+        two always agree -- an order and its reservation are marked UNKNOWN
+        together, and ``require_clean`` checks the order store first, so this
+        never fires before it. It becomes load-bearing only when reservations
+        are durable and orders are not: after a real restart the persisted
+        UNKNOWN reservation survives while the in-memory order object does not,
+        and this is what keeps INVARIANT 5 blocking across that boundary.
+
+        It can only ever *add* a refusal, never remove one, so it weakens no
+        gate. Raised as :class:`UnknownOrderStateBlocked`, which the submit chain
+        already turns into a RECONCILIATION-gate refusal that releases the
+        just-claimed (still-RESERVED) key -- nothing was sent, and the UNKNOWN
+        reservation it is blocking on is a *different* key, left untouched.
+        """
+        if self._dedupe.has_unknown():
+            raise UnknownOrderStateBlocked(
+                "an idempotency reservation is in UNKNOWN state (its order may "
+                "not have survived a restart); no new orders will be accepted "
+                "until it is reconciled (INVARIANT 5)"
+            )
 
     def _mint(self, order: Order, approval: RiskApproval) -> ExecutionToken:
         """Turn a risk approval into an execution token.
@@ -912,6 +938,12 @@ class ExecutionGateway:
                 "venue_state": fetched.as_details(),
             },
         )
+        # A cancel that retired the order (or found it already filled) closes
+        # its reservation out, the same as the sync path. See
+        # _settle_reservation_if_terminal for why this preserves INVARIANT 12.
+        self._settle_reservation_if_terminal(
+            order, note="settled via cancel"
+        )
         return cancel_ack
 
     def sync_order(self, order: Order, *, operator: Principal) -> BrokerAck:
@@ -1016,7 +1048,50 @@ class ExecutionGateway:
                 "ack": ack.as_details(),
             },
         )
+        # A sync that learned the order is finished must close its reservation
+        # too, exactly as _settle does on the submit path. Safe: it only moves a
+        # RESERVED/SUBMITTED key to SETTLED, which frees nothing (INVARIANT 12).
+        self._settle_reservation_if_terminal(
+            order, note=f"settled via sync: venue {ack.outcome.value}"
+        )
         return ack
+
+    def _settle_reservation_if_terminal(self, order: Order, *, note: str) -> None:
+        """Settle the order's reservation once the order itself is terminal.
+
+        ``sync_order`` and ``cancel`` can drive an order to a terminal state
+        (FILLED/REJECTED/CANCELED/EXPIRED) by learning what the venue actually
+        did. When they do, the reservation must close out too, exactly as
+        :meth:`_settle` does on the submit path -- otherwise a finished order's
+        key is left in SUBMITTED and :meth:`IdempotencyRegistry.in_flight`
+        reports it as live forever.
+
+        **Why this does not weaken INVARIANT 12.** ``SETTLED`` is as un-reusable
+        as ``SUBMITTED``: :meth:`IdempotencyRegistry.reserve` refuses any key
+        that already has a reservation in *any* state, and ``SETTLED`` has no
+        successor in the transition table, so the key can never be freed for a
+        duplicate. Moving SUBMITTED -> SETTLED is a truthful relabelling of a key
+        that is already permanently claimed; it frees nothing and permits no
+        retry.
+
+        **Why it is safe against UNKNOWN.** It never touches an UNKNOWN
+        reservation -- leaving UNKNOWN is :meth:`resolve_unknown`'s job (the
+        transition table forbids UNKNOWN -> SETTLED, so skipping UNKNOWN here is
+        also what keeps the state machine legal). And an UNKNOWN *order* is not
+        terminal, so for an UNKNOWN order this returns at the first guard. The
+        reservation lookup is a no-op when the key is already SETTLED, so this is
+        safe to call unconditionally.
+        """
+        if not order.state.is_terminal:
+            return
+        reservation = self._dedupe.get(order.idempotency_key)
+        if reservation is None:
+            return
+        if reservation.state in (
+            ReservationState.RESERVED,
+            ReservationState.SUBMITTED,
+        ):
+            self._dedupe.mark_settled(order.idempotency_key, note=note)
 
     def _refuse_cancel(
         self, order: Order, operator: Principal, reason: str

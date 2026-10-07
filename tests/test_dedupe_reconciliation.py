@@ -687,5 +687,154 @@ class TestClearingAMismatch(GateFixture):
         self.assertFalse(self.gate.has_mismatch)
 
 
+class TestRepositoryBackedRegistry(unittest.TestCase):
+    """Tests for IdempotencyRegistry using ReservationRepositoryPort."""
+
+    def setUp(self) -> None:
+        self.clock = ManualClock()
+        self.sink = InMemoryAuditSink()
+        self.audit = AuditLog(self.sink, clock=self.clock)
+        from trading.adapters.persistence import ReservationRepository
+
+        self.repository = ReservationRepository()
+        self.registry = IdempotencyRegistry(
+            self.audit, clock=self.clock, repository=self.repository
+        )
+        self.key = intent().idempotency_key
+
+    def test_reservation_persisted_to_repository(self) -> None:
+        """Reservation created via registry is stored in repository."""
+        reservation = self.registry.reserve(self.key, "ORD-1")
+        from_db = self.repository.get(self.key)
+        self.assertIsNotNone(from_db)
+        self.assertEqual(from_db.key, reservation.key)
+        self.assertEqual(from_db.order_id, reservation.order_id)
+        self.assertEqual(from_db.state, reservation.state)
+
+    def test_state_transition_persisted(self) -> None:
+        """State transitions are persisted to repository."""
+        self.registry.reserve(self.key, "ORD-1")
+        self.registry.mark_submitted(self.key, note="submitted to venue")
+
+        from_db = self.repository.get(self.key)
+        self.assertEqual(from_db.state, ReservationState.SUBMITTED)
+        self.assertEqual(from_db.note, "submitted to venue")
+
+    def test_repository_survives_registry_recreation(self) -> None:
+        """New registry instance can access existing reservations."""
+        self.registry.reserve(self.key, "ORD-1")
+        self.registry.mark_submitted(self.key)
+
+        # Create a new registry with same repository
+        new_registry = IdempotencyRegistry(
+            self.audit, clock=self.clock, repository=self.repository
+        )
+
+        # Can retrieve the reservation from new instance
+        reservation = new_registry.get(self.key)
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation.state, ReservationState.SUBMITTED)
+        self.assertEqual(reservation.order_id, "ORD-1")
+
+    def test_unknown_blocks_new_orders_via_repository(self) -> None:
+        """UNKNOWN reservation in repository blocks new order submissions."""
+        self.registry.reserve(self.key, "ORD-1")
+        self.registry.mark_unknown(self.key, note="timeout")
+
+        # New registry instance sees UNKNOWN state
+        new_registry = IdempotencyRegistry(
+            self.audit, clock=self.clock, repository=self.repository
+        )
+        self.assertTrue(new_registry.has_unknown())
+
+        # Duplicate key is rejected
+        with self.assertRaises(DuplicateOrderRejected):
+            new_registry.reserve(self.key, "ORD-2")
+
+    def test_resolve_unknown_persisted(self) -> None:
+        """Resolving UNKNOWN persists SETTLED state."""
+        self.registry.reserve(self.key, "ORD-1")
+        self.registry.mark_unknown(self.key, note="timeout")
+        self.registry.resolve_unknown(self.key, resolution="venue confirms never arrived")
+
+        from_db = self.repository.get(self.key)
+        self.assertEqual(from_db.state, ReservationState.SETTLED)
+        self.assertIn("reconciled", from_db.note)
+
+    def test_concurrent_access_via_repository(self) -> None:
+        """Concurrent access is thread-safe when sharing repository."""
+        import threading
+
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(8)
+
+        def attempt(n: int) -> None:
+            registry = IdempotencyRegistry(
+                self.audit, clock=self.clock, repository=self.repository
+            )
+            key = intent(signal_id=f"sig-{n}").idempotency_key
+            try:
+                barrier.wait()
+                registry.reserve(key, f"ORD-{n}")
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.repository.all_reservations()), 8)
+
+    def test_all_reservations_via_repository(self) -> None:
+        """all_reservations returns all reservations from repository."""
+        key1 = intent(signal_id="a").idempotency_key
+        key2 = intent(signal_id="b").idempotency_key
+
+        self.registry.reserve(key1, "ORD-1")
+        self.registry.reserve(key2, "ORD-2")
+
+        all_res = self.repository.all_reservations()
+        self.assertEqual(len(all_res), 2)
+
+    def test_unknown_reservations_via_repository(self) -> None:
+        """unknown_reservations filters UNKNOWN state from repository."""
+        key1 = intent(signal_id="a").idempotency_key
+        key2 = intent(signal_id="b").idempotency_key
+        key3 = intent(signal_id="c").idempotency_key
+
+        self.registry.reserve(key1, "ORD-1")
+        self.registry.mark_submitted(key1)
+        self.registry.reserve(key2, "ORD-2")
+        self.registry.mark_unknown(key2, note="timeout")
+        self.registry.reserve(key3, "ORD-3")
+        self.registry.mark_settled(key3, note="completed")
+
+        unknown = self.repository.unknown_reservations()
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0].order_id, "ORD-2")
+
+    def test_release_unsent_via_repository(self) -> None:
+        """release_unsent removes reservation from repository."""
+        self.registry.reserve(self.key, "ORD-1")
+        self.registry.release_unsent(self.key, reason="risk rejected")
+
+        self.assertIsNone(self.repository.get(self.key))
+        self.assertFalse(self.registry.is_claimed(self.key))
+
+    def test_len_counts_all_reservations(self) -> None:
+        """__len__ returns correct count from repository."""
+        self.assertEqual(len(self.registry), 0)
+
+        self.registry.reserve(self.key, "ORD-1")
+        self.assertEqual(len(self.registry), 1)
+
+        key2 = intent(signal_id="b").idempotency_key
+        self.registry.reserve(key2, "ORD-2")
+        self.assertEqual(len(self.registry), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

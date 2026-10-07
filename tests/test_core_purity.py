@@ -677,7 +677,8 @@ class TestKernelIsCleanAtRuntime(PurityCase):
             "def _boom(*a, **k):\n"
             "    raise AssertionError('an adapter opened a socket at import time')\n"
             "socket.socket = _boom\n"
-            "import trading.adapters.memory, trading.adapters.paper, trading.strategy\n"
+            "import trading.adapters.memory, trading.adapters.paper\n"
+            "import trading.adapters.lifecycle, trading.strategy\n"
             "print('ok')\n"
         )
 

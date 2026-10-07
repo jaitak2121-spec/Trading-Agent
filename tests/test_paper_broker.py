@@ -363,14 +363,17 @@ class TestLimitOrders(PaperCase):
         self.assertIs(found.outcome, AckOutcome.ACCEPTED)
         self.assertIn(order.idempotency_key, self.broker.resting_keys)
 
-    def test_a_resting_order_does_not_fill_itself_later(self):
-        """Stage 2F rests it and stops there; driving it to a fill is 2G's job."""
+    def test_a_resting_order_fills_once_the_book_reaches_it(self):
+        """The fill that happens after the acknowledgement, which 2F could not have."""
         order, _ = self.place(self.limit("49000"))
         self.publish(Price("48000", USD), Price("48010", USD))
-        self.assertIs(
-            self.broker.fetch_order_state(order).outcome, AckOutcome.ACCEPTED
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.FILLED)
+        self.assertEqual(found.fill_price, Price("48010", USD))
+        self.assertEqual(found.filled_quantity, DEFAULT_QUANTITY)
+        self.assertEqual(
+            self.broker.fetch_positions().positions, {SYMBOL: DEFAULT_QUANTITY}
         )
-        self.assertEqual(self.broker.fetch_positions().positions, {})
 
     def test_slippage_can_push_a_marginal_limit_out_of_reach(self):
         """The realistic outcome: the price moved away before we got there."""
@@ -388,6 +391,198 @@ class TestLimitOrders(PaperCase):
         self.assertIs(ack.outcome, AckOutcome.REJECTED)
         self.assertIn(PaperReject.CURRENCY_MISMATCH, ack.message)
         self.assertIn("INR", ack.message)
+
+
+class TestRestingOrdersAreReconsidered(PaperCase):
+    """Asking about a resting order re-runs the fill model against today's book.
+
+    Nothing in this process fills in the background, so the poll is the only
+    thing that can move a resting order forward. That makes ``fetch_order_state``
+    a read with an effect, and the tests below are mostly about bounding that
+    effect: it can only reach a fill, it can only do so once, and a feed having a
+    bad moment must not be mistaken for the venue disowning the order.
+    """
+
+    def limit(self, price: str, *, side: OrderSide = OrderSide.BUY):
+        return self.order(
+            side=side,
+            order_type=OrderType.LIMIT,
+            limit_price=Price(price, USD),
+        )
+
+    def resting(self, price: str = "49000", *, side: OrderSide = OrderSide.BUY):
+        order, ack = self.place(self.limit(price, side=side))
+        self.assertIs(ack.outcome, AckOutcome.ACCEPTED, ack.message)
+        return order, ack
+
+    def reach(self):
+        """Move the book down through a 49000 buy limit."""
+        self.publish(Price("48000", USD), Price("48010", USD))
+
+    # -- the fill it can now reach ----------------------------------------
+
+    def test_the_fill_keeps_the_identifier_the_order_already_carries(self):
+        """A different id is a contradiction sync_order refuses, and should."""
+        order, resting = self.resting()
+        self.reach()
+        self.assertEqual(
+            self.broker.fetch_order_state(order).broker_order_id,
+            resting.broker_order_id,
+        )
+
+    def test_polling_does_not_burn_identifiers(self):
+        """Numbering records how many orders arrived, not how often we looked."""
+        order, resting = self.resting()
+        self.assertEqual(resting.broker_order_id, "PAPER-000001")
+        for _ in range(5):
+            self.broker.fetch_order_state(order)
+        self.assertEqual(self.ack().broker_order_id, "PAPER-000002")
+
+    def test_a_sell_limit_fills_when_the_bid_rises_to_it(self):
+        order, _ = self.resting("51000", side=OrderSide.SELL)
+        self.publish(Price("51500", USD), Price("51510", USD))
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.FILLED)
+        self.assertEqual(found.fill_price, Price("51500", USD))
+        self.assertEqual(
+            self.broker.fetch_positions().positions[SYMBOL], -DEFAULT_QUANTITY
+        )
+
+    def test_a_book_that_refills_lets_a_crossing_limit_through(self):
+        """The order was resting for want of depth, not for want of price."""
+        self.broker.set_depth(SYMBOL, Quantity.zero(ASSET))
+        order, _ = self.resting("50100")
+        self.broker.set_depth(SYMBOL, DEFAULT_QUANTITY)
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.FILLED)
+        self.assertEqual(found.filled_quantity, DEFAULT_QUANTITY)
+
+    def test_the_reconsidered_fill_is_still_bounded_by_depth(self):
+        """One fill model, so a poll cannot clear a book a placement could not."""
+        order, _ = self.resting()
+        self.broker.set_depth(SYMBOL, Quantity("0.0004", ASSET))
+        self.reach()
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.FILLED)
+        self.assertEqual(found.filled_quantity, Quantity("0.0004", ASSET))
+        self.assertIn("partial fill", found.message)
+
+    # -- and nothing else --------------------------------------------------
+
+    def test_a_limit_the_book_still_has_not_reached_reports_what_it_had(self):
+        """Verbatim: a message that drifted would read as news in the audit trail."""
+        order, resting = self.resting()
+        self.publish(Price("49500", USD), Price("49510", USD))
+        self.assertEqual(self.broker.fetch_order_state(order), resting)
+
+    def test_a_dark_feed_leaves_a_resting_order_resting(self):
+        """A quote we cannot read is not the venue disowning the order.
+
+        Surfacing the rejection _decide returns would drive every live resting
+        order to REJECTED at the first gap in the feed.
+        """
+        order, resting = self.resting()
+        self.feed.go_dark(SYMBOL)
+        self.assertEqual(self.broker.fetch_order_state(order), resting)
+        self.assertIn(order.idempotency_key, self.broker.resting_keys)
+
+    def test_a_frozen_feed_leaves_a_resting_order_resting(self):
+        order, resting = self.resting()
+        self.clock.advance(600)
+        self.assertEqual(self.broker.fetch_order_state(order), resting)
+
+    def test_a_dark_feed_cannot_unwind_a_fill_either(self):
+        order, _ = self.resting()
+        self.reach()
+        filled = self.broker.fetch_order_state(order)
+        self.feed.go_dark(SYMBOL)
+        self.assertEqual(self.broker.fetch_order_state(order), filled)
+
+    def test_it_fills_at_most_once(self):
+        """``depth`` is what one placement can take, not a pool that refills."""
+        order, _ = self.resting()
+        self.reach()
+        first = self.broker.fetch_order_state(order)
+        again = self.broker.fetch_order_state(order)
+        self.assertEqual(again, first)
+        self.assertEqual(
+            self.broker.fetch_positions().positions, {SYMBOL: DEFAULT_QUANTITY}
+        )
+
+    def test_a_fill_is_not_repriced_when_the_book_moves_again(self):
+        """It already happened. Re-pricing it would rewrite a trade."""
+        order, _ = self.resting()
+        self.reach()
+        self.broker.fetch_order_state(order)
+        self.publish(Price("40000", USD), Price("40010", USD))
+        found = self.broker.fetch_order_state(order)
+        self.assertEqual(found.fill_price, Price("48010", USD))
+
+    def test_a_partial_fill_is_not_topped_up(self):
+        broker = PaperBroker(
+            clock=self.clock,
+            quotes=self.feed,
+            depth={SYMBOL: Quantity("0.0004", ASSET)},
+        )
+        order = self.order()
+        partial = broker.place_order(order, token=self.token(order))
+        self.assertEqual(partial.filled_quantity, Quantity("0.0004", ASSET))
+        broker.set_depth(SYMBOL, DEFAULT_QUANTITY)
+        self.assertEqual(broker.fetch_order_state(order), partial)
+        self.assertEqual(
+            broker.fetch_positions().positions, {SYMBOL: Quantity("0.0004", ASSET)}
+        )
+
+    def test_a_canceled_order_has_no_record_to_reconsider(self):
+        """Withdrawn is withdrawn, however kindly the book behaves afterwards."""
+        order, _ = self.resting()
+        self.broker.cancel_order(order)
+        self.reach()
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.REJECTED)
+        self.assertEqual(self.broker.fetch_positions().positions, {})
+
+    def test_reconsidering_never_claims_not_to_know(self):
+        """The property the whole module rests on, checked on this path too."""
+        order, _ = self.resting()
+        for act in (
+            lambda: self.feed.go_dark(SYMBOL),
+            lambda: self.publish(),
+            lambda: self.clock.advance(600),
+            lambda: self.publish(),
+            self.reach,
+            lambda: self.broker.set_depth(SYMBOL, Quantity.zero(ASSET)),
+        ):
+            act()
+            self.assertIsNot(
+                self.broker.fetch_order_state(order).outcome, AckOutcome.UNCERTAIN
+            )
+
+
+class TestReconsiderationUsesTheSameFillModel(PaperCase):
+    """Slippage is not a placement-time decoration; a later fill pays it too."""
+
+    slippage_bps = 50
+
+    def test_a_poll_fill_is_priced_the_way_a_placement_would_have_been(self):
+        order = self.order(
+            order_type=OrderType.LIMIT, limit_price=Price("48300", USD)
+        )
+        self.place(order)
+        self.publish(Price("48000", USD), Price("48010", USD))
+        found = self.broker.fetch_order_state(order)
+        self.assertIs(found.outcome, AckOutcome.FILLED)
+        # 48010 * (1 + 50/10_000), against the order as always.
+        self.assertEqual(found.fill_price, Price("48250.05", USD))
+
+    def test_slippage_can_hold_a_marginal_limit_out_of_reach_on_a_poll_too(self):
+        """48010 slips to 48250.05, which a limit of 48100 does not reach."""
+        order = self.order(
+            order_type=OrderType.LIMIT, limit_price=Price("48100", USD)
+        )
+        _, resting = self.place(order)
+        self.publish(Price("48000", USD), Price("48010", USD))
+        self.assertEqual(self.broker.fetch_order_state(order), resting)
 
 
 class TestRejections(PaperCase):
@@ -923,6 +1118,209 @@ class TestSlippageThroughTheGateway(GatewayCase):
         self.assertIsNotNone(before)
         self.assertIsNotNone(after)
         self.assertTrue(after.amount < before.amount, f"{before} -> {after}")
+
+
+class TestARestingOrderFillsThroughTheGateway(GatewayCase):
+    """The whole route, end to end: rest at the venue, fill later, reach the book.
+
+    This is the case the system could not represent before. ``place_order``
+    reports what happened at the moment of placement, so a limit that the market
+    only reaches afterwards used to be invisible: ACCEPTED forever, no position,
+    no cost basis, and therefore nothing the daily-loss limit could ever see.
+    The venue re-evaluating on a poll supplies the fill; ``sync_order`` is what
+    carries it into the portfolio.
+    """
+
+    def limit_intent(self, price: str, *, side: OrderSide = OrderSide.BUY):
+        return OrderIntent(
+            strategy_id="strat-1",
+            signal_id=f"sig-limit-{price}-{side.value}",
+            symbol=SYMBOL,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=DEFAULT_QUANTITY,
+            limit_price=Price(price, USD),
+        )
+
+    def rest(self, price: str = "49000", *, side: OrderSide = OrderSide.BUY):
+        result = self.rig.submit(self.limit_intent(price, side=side))
+        self.assertTrue(result.is_executed, result.reason)
+        self.assertIs(result.order.state, OrderState.ACCEPTED)
+        return result.order
+
+    def reach(self):
+        self.feed.publish(SYMBOL, Price("48000", USD), Price("48010", USD))
+
+    def sync(self, order):
+        return self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+
+    # -- the order rests ---------------------------------------------------
+
+    def test_a_limit_the_book_has_not_reached_rests_rather_than_fills(self):
+        order = self.rest()
+        self.assertEqual(self.rig.positions.snapshot(), {})
+        self.assertIsNotNone(order.broker_order_id)
+
+    def test_syncing_an_order_the_book_has_not_reached_changes_nothing(self):
+        order = self.rest()
+        ack = self.sync(order)
+        self.assertIs(ack.outcome, AckOutcome.ACCEPTED)
+        self.assertIs(order.state, OrderState.ACCEPTED)
+        self.assertEqual(self.rig.positions.snapshot(), {})
+
+    def test_reading_positions_does_not_move_a_resting_order(self):
+        """Only asking about *that order* re-evaluates it. A reconciliation
+        sweep reads the venue's book and must not fill anything by looking."""
+        self.rest()
+        self.reach()
+        self.assertEqual(self.paper.fetch_positions().positions, {})
+
+    # -- and then the book reaches it --------------------------------------
+
+    def test_the_order_transitions_to_filled(self):
+        order = self.rest()
+        self.reach()
+        ack = self.sync(order)
+        self.assertIs(ack.outcome, AckOutcome.FILLED)
+        self.assertIs(order.state, OrderState.FILLED)
+        self.assertTrue(order.state.is_terminal)
+
+    def test_the_fill_reaches_the_portfolio_at_the_price_the_venue_gave(self):
+        order = self.rest()
+        self.reach()
+        self.sync(order)
+        self.assertEqual(self.rig.positions.snapshot()[SYMBOL], DEFAULT_QUANTITY)
+        self.assertEqual(
+            self.rig.portfolio.position(SYMBOL).average_entry_price,
+            Price("48010", USD),
+        )
+
+    def test_the_venue_and_the_ledger_agree_afterwards(self):
+        """INVARIANT 6: the fill lands on both sides or the gate must see it."""
+        order = self.rest()
+        self.reach()
+        self.sync(order)
+        report = self.rig.reconciliation.reconcile(
+            self.paper.fetch_positions().positions
+        )
+        self.assertTrue(report.is_clean, report.as_details())
+
+    def test_the_identifier_survives_the_round_trip(self):
+        """The venue reuses it, so the gateway's mismatch guard stays quiet."""
+        order = self.rest()
+        placed = order.broker_order_id
+        self.reach()
+        ack = self.sync(order)
+        self.assertEqual(ack.broker_order_id, placed)
+        self.assertEqual(order.broker_order_id, placed)
+
+    def test_the_sync_is_audited_around_the_fill(self):
+        order = self.rest()
+        self.reach()
+        self.sync(order)
+        actions = self.rig.actions()
+        self.assertIn("gateway.sync_requested", actions)
+        self.assertIn("gateway.sync_completed", actions)
+        self.assertLess(
+            actions.index("gateway.sync_requested"),
+            actions.index("gateway.sync_completed"),
+        )
+
+    def test_the_fill_is_booked_exactly_once(self):
+        """A second sync is refused as terminal rather than booking again."""
+        order = self.rest()
+        self.reach()
+        self.sync(order)
+        with self.assertRaises(SafetyViolation):
+            self.sync(order)
+        self.assertEqual(self.rig.positions.snapshot()[SYMBOL], DEFAULT_QUANTITY)
+
+    def test_a_sell_side_fill_takes_the_same_route(self):
+        order = self.rest("51000", side=OrderSide.SELL)
+        self.feed.publish(SYMBOL, Price("51500", USD), Price("51510", USD))
+        self.sync(order)
+        self.assertIs(order.state, OrderState.FILLED)
+        self.assertEqual(self.rig.positions.snapshot()[SYMBOL], -DEFAULT_QUANTITY)
+
+    def test_a_later_fill_is_visible_to_the_daily_loss_limit(self):
+        """The reason this matters: an invisible fill is an unmeasured loss.
+
+        The resting buy fills at 48010 and is sold straight back into the same
+        book at 48000, so the round trip realizes a loss the ledger can name.
+        """
+        order = self.rest()
+        self.reach()
+        self.sync(order)
+        self.rig.submit(side=OrderSide.SELL)
+        self.assertTrue(
+            self.rig.risk.pnl.realized_loss.amount > 0, self.rig.risk.pnl.realized
+        )
+
+    def test_a_strategy_cannot_sync_its_own_order_into_existence(self):
+        """RECONCILE is the operator's and the system's; nothing changes on refusal."""
+        order = self.rest()
+        self.reach()
+        with self.assertRaises(UnauthorizedAction):
+            self.rig.gateway.sync_order(order, operator=self.rig.strategy_id)
+        self.assertIs(order.state, OrderState.ACCEPTED)
+        self.assertEqual(self.rig.positions.snapshot(), {})
+
+    def test_a_cancelled_order_does_not_fill_behind_the_cancel(self):
+        """Withdrawing it at the venue is what stops a later poll reviving it."""
+        order = self.rest()
+        self.rig.gateway.cancel(order, operator=self.rig.operator_id)
+        self.assertIs(order.state, OrderState.CANCELED)
+        self.reach()
+        self.assertEqual(self.paper.fetch_order_state(order).outcome,
+                         AckOutcome.REJECTED)
+        self.assertEqual(self.rig.positions.snapshot(), {})
+
+
+class TestARestingOrderPartiallyFillsThroughTheGateway(GatewayCase):
+    """A poll fill is bounded by the book, and a bounded fill stays open."""
+
+    depth = {SYMBOL: Quantity("0.0004", ASSET)}
+
+    def test_it_lands_in_partially_filled_and_stays_open(self):
+        intent = OrderIntent(
+            strategy_id="strat-1",
+            signal_id="sig-partial-limit",
+            symbol=SYMBOL,
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=DEFAULT_QUANTITY,
+            limit_price=Price("49000", USD),
+        )
+        order = self.rig.submit(intent).order
+        self.assertIs(order.state, OrderState.ACCEPTED)
+        self.feed.publish(SYMBOL, Price("48000", USD), Price("48010", USD))
+        self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+        self.assertIs(order.state, OrderState.PARTIALLY_FILLED)
+        self.assertTrue(order.is_open)
+        self.assertEqual(
+            self.rig.positions.snapshot()[SYMBOL], Quantity("0.0004", ASSET)
+        )
+
+    def test_re_syncing_the_remainder_books_nothing_further(self):
+        """The venue does not top up, so the delta is zero and says so."""
+        intent = OrderIntent(
+            strategy_id="strat-1",
+            signal_id="sig-partial-resync",
+            symbol=SYMBOL,
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=DEFAULT_QUANTITY,
+            limit_price=Price("49000", USD),
+        )
+        order = self.rig.submit(intent).order
+        self.feed.publish(SYMBOL, Price("48000", USD), Price("48010", USD))
+        self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+        self.paper.set_depth(SYMBOL, DEFAULT_QUANTITY)
+        self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+        self.assertIs(order.state, OrderState.PARTIALLY_FILLED)
+        self.assertEqual(
+            self.rig.positions.snapshot()[SYMBOL], Quantity("0.0004", ASSET)
+        )
 
 
 class TestNoNetworkAnywhere(unittest.TestCase):
