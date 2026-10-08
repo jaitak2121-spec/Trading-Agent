@@ -757,6 +757,12 @@ class Order:
             currency = _currency_by_code(quote_code)
             with decimal.localcontext(FINANCIAL_CONTEXT):
                 unit_price = Decimal(str(payload["notional_total"])) / filled.amount
+            # Seed a fillable state first. The live transition table forbids
+            # DRAFT -> FILLED, but a restore reconstructs a state the order
+            # legitimately reached, so it starts at PENDING_NEW (the first
+            # fillable state) and apply_fill then enforces the overfill, asset,
+            # currency, and progression rules on the way to its derived state.
+            order._state = OrderState.PENDING_NEW
             order.apply_fill(
                 filled,
                 Price.rounded(unit_price, currency, max_scale=_PRICE_SCALE),
@@ -810,6 +816,24 @@ class OrderStore:
                 raise SafetyViolation(f"order {order.order_id} is already stored")
             self._by_id[order.order_id] = order
             self._by_key[order.idempotency_key] = order.order_id
+            return order
+
+    def update(self, order: Order) -> Order:
+        """Persist a mutated order's state.
+
+        In memory this is close to a no-op: the stored value is the same mutable
+        object the caller just changed, so there is nothing to copy. It still
+        verifies the order was added first (a mutation to an unknown order is a
+        bug), and it is the hook a durable store overrides to actually write the
+        new state to disk. The gateway calls it at every point it advances an
+        order -- above all after moving it to ``PENDING_NEW`` and *before* the
+        order is sent, so a durable store records the intent before the venue
+        could ever have seen it (the write-before-send rule).
+        """
+        with self._lock:
+            if order.order_id not in self._by_id:
+                raise KeyError(f"no order with id {order.order_id!r}")
+            self._by_id[order.order_id] = order
             return order
 
     def get(self, order_id: str) -> Order:
