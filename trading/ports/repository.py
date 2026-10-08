@@ -32,6 +32,18 @@ class OrderRepositoryPort(ABC):
         """Persist a new order. Must reject a duplicate order id."""
 
     @abstractmethod
+    def update(self, order: Order) -> Order:
+        """Persist a mutated order's state.
+
+        Called whenever the kernel advances an order -- above all after moving it
+        to ``PENDING_NEW`` and *before* it is sent, so a durable implementation
+        records the intent before the venue could have seen it (the
+        write-before-send rule in this module's docstring). An in-memory store
+        that holds the order by reference satisfies this trivially; a durable one
+        must write. Must raise ``KeyError`` for an order that was never added.
+        """
+
+    @abstractmethod
     def get(self, order_id: str) -> Order:
         """Fetch by id, raising ``KeyError`` if absent."""
 
