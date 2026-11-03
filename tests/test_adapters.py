@@ -30,7 +30,7 @@ from trading.core.clock import ManualClock
 from trading.core.errors import SafetyViolation, UnauthorizedAction
 from trading.core.money import USD, Price, Quantity
 from trading.core.orders import Order, OrderIntent, OrderSide, OrderType
-from trading.ports.broker import AckOutcome, BrokerAck
+from trading.ports.broker import AckOutcome, BrokerAck, BrokerOrderStatus
 
 SYMBOL = "BTCUSD"
 ASSET = "BTC"
@@ -270,6 +270,29 @@ class TestScriptedAcks(BrokerCase):
         """Otherwise a fill could be recorded with no idea what it cost."""
         with self.assertRaises(ValueError):
             BrokerAck(AckOutcome.FILLED)
+
+    def test_terminal_observation_requires_cumulative_quantity(self):
+        with self.assertRaises(ValueError):
+            BrokerAck(
+                AckOutcome.ACCEPTED,
+                terminal_status=BrokerOrderStatus.CANCELED,
+            )
+
+    def test_terminal_observation_with_fills_must_use_filled_outcome(self):
+        with self.assertRaises(ValueError):
+            BrokerAck(
+                AckOutcome.ACCEPTED,
+                filled_quantity=Quantity("0.0001", ASSET),
+                terminal_status=BrokerOrderStatus.CANCELED,
+            )
+
+    def test_zero_fill_terminal_observation_is_json_safe(self):
+        ack = BrokerAck(
+            AckOutcome.ACCEPTED,
+            filled_quantity=Quantity.zero(ASSET),
+            terminal_status=BrokerOrderStatus.EXPIRED,
+        )
+        self.assertEqual(ack.as_details()["terminal_status"], "expired")
 
 
 class TestWhatWeLearnVersusWhatHappened(BrokerCase):

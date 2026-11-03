@@ -37,6 +37,7 @@ from trading.core.portfolio import Portfolio
 from trading.core.reconciliation import PositionLedger, ReconciliationGate
 from trading.core.risk import RiskEngine
 from trading.ports.broker import AckOutcome, BrokerPort
+from trading.ports.reservation_repository import ReservationRepositoryPort
 
 #: The venue price used throughout. 0.001 BTC = 50 USD, comfortably inside the
 #: default 100 USD per-order ceiling, so a plain order succeeds and a test has to
@@ -140,6 +141,8 @@ def build_rig(
     token_ttl_seconds: int = 30,
     clock: ManualClock | None = None,
     broker: BrokerPort | None = None,
+    order_store: OrderStore | None = None,
+    reservation_repository: ReservationRepositoryPort | None = None,
 ) -> Rig:
     """Wire a complete system.
 
@@ -168,7 +171,9 @@ def build_rig(
     gateway_id = Principal("gateway-1", Role.EXECUTION_GATEWAY)
     operator_id = Principal("operator-1", Role.OPERATOR)
 
-    orders = OrderStore()
+    # Repositories implement ``__len__``; an injected empty store is therefore
+    # falsey and must not be mistaken for "not supplied".
+    orders = order_store if order_store is not None else OrderStore()
     positions = PositionLedger()
     # The portfolio wraps the ledger rather than shadowing it: the gateway writes
     # fills through the portfolio so a cost basis is recorded, and the
@@ -188,7 +193,9 @@ def build_rig(
         audit=audit,
         clock=clock,
     )
-    dedupe = IdempotencyRegistry(audit, clock=clock)
+    dedupe = IdempotencyRegistry(
+        audit, clock=clock, repository=reservation_repository
+    )
     # No trigger file: the probe would look at the filesystem, and a test must
     # not depend on paths. engage() is the only way in here.
     kill_switch = KillSwitch(audit, clock=clock, presence_probe=lambda _path: False)

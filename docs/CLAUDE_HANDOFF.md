@@ -23,7 +23,7 @@ architecturally separate:
 2. **Live / autonomous mode** — execution through one chokepoint, only after
    every authorization, risk, sizing, reconciliation and mode check passes.
 
-Live trading is **off** and **unimplemented**. There is no network code, no
+Live trading is **off** and **unimplemented**. There is no exchange client, no
 database, no broker credential path, and no third-party dependency anywhere in
 the project — including the tests. Python 3.13.7, stdlib only.
 
@@ -110,11 +110,10 @@ the kernel is injected through it: `trading/ports/repository.py` (orders,
 positions), `trading/ports/reservation_repository.py` and
 `trading/ports/recovery.py`, implemented in-memory by
 `trading/adapters/persistence/` and driven by
-`trading/adapters/recovery.RestartRecoveryCoordinator`. **Nothing is written to
-a disk or a database, so state still does not survive a real process exit.** What
-is tested is that a stack *rebuilt* around surviving repositories keeps
-INVARIANT 5's block and INVARIANT 12's refusal
-(`tests/test_restart_recovery_e2e.py`).
+`trading/adapters/recovery.RestartRecoveryCoordinator`. Opt-in durable adapters
+now write orders, reservations, and positions to atomic JSON snapshots. A stack
+rebuilt from those files keeps INVARIANT 5's block and INVARIANT 12's refusal;
+the default composition remains in-memory.
 
 Defect 11 below (§7) was repaired as part of this pass: the persistence package
 now exports `OrderStoreAdapter` under the name `OrderStore`, and the adapter
@@ -227,13 +226,15 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   The repository seam is now real and the kernel is injected through it:
   `trading/ports/repository.py` (orders, positions) plus
   `trading/ports/reservation_repository.py` and `trading/ports/recovery.py`
-  (new in 2H), implemented in-memory by `trading/adapters/persistence/` and
-  driven by `trading/adapters/recovery.RestartRecoveryCoordinator`. The caveat:
-  **nothing is written to a disk or a database, so state still does not survive
-  a real process exit.** What is tested is that a stack *rebuilt* around
-  surviving repositories keeps INVARIANT 5's block and INVARIANT 12's refusal
-  (`tests/test_restart_recovery_e2e.py`). Durability itself is the remaining
-  work, and it is a database adapter, not a kernel change.
+  (new in 2H), implemented both in memory and by opt-in atomic JSON adapters in
+  `trading/adapters/persistence/`, and driven by
+  `trading/adapters/recovery.RestartRecoveryCoordinator`. Tests rebuild the
+  stack from disk and retain UNKNOWN blocking, duplicate prevention, order
+  lifecycle state, and local positions. `SQLiteState` now adds shared
+  transactions across orders, reservations, positions, portfolio accounting,
+  daily risk/rate state, and audit rows. The paper composition is wired through
+  `sqlite_path` / `--state-db`. The composition now runs recovery and a venue
+  sweep before exposing readiness; ambiguity or position mismatch blocks it.
 - **2I — Reconciliation.** **Landed.** Venue-wide order *and* position
   reconciliation via `ReconciliationCoordinator`, with a new
   `BrokerOrderInventoryPort` and validated `BrokerOrderSnapshot` observations.
@@ -248,18 +249,123 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   `trading/adapters/operations.py`: a redacted `OperationalStatus` with a
   fail-closed `ready` predicate, and `StartupCoordinator` for configuration
   validation, recovery scan and initial sweep. See §7 item 17.
-- **2L — Tests for all critical paths.** **Landed.** 1875 tests, 96.5% coverage;
-  figures in §8.
-- **Not started: real durability, a live or sandbox broker connection, and any
-  inbound adapter (HTTP/UI).** These are the three things between this repository
-  and a small live deployment, in that order.
+- **2L — Tests for all critical paths.** **Landed.** 2,096 tests; the last
+  measured whole-project coverage was 95.2% before the CoinSwitch adapter.
+- **Landed:** transactional SQLite persistence plus paper-app startup recovery.
+  Execution settlement and daily risk/rate state are transactional; construction
+  scans recovery state, sweeps the venue, and feeds the result into readiness.
+- **Landed:** the ingestion-driven `RealtimePaperService` operational cycle.
+  Each pass validates quotes and closed bars, synchronizes existing orders before
+  sizing new exposure, refuses on startup/feed/gap/lifecycle findings, and routes
+  accepted signals through the existing gateway only. The service is synchronous
+  by design so a later supervisor adds scheduling without adding execution logic.
+- **Landed:** runnable local paper product. `PaperServiceSupervisor` owns the
+  cycle worker and stops visibly on a redacted error; `DashboardServer` exposes a
+  loopback-only read-only operator UI/API; `build_demo_paper_application` wires a
+  deterministic synthetic stream through the real ingestion and execution path.
+- **Landed:** repeatable application soak command. `--soak-cycles N` drives the
+  assembled ingestion/reconciliation/strategy/gateway path synchronously and
+  fails on unhealthy cycles, blocked readiness, UNKNOWN state, or audit-chain
+  damage. A 190-cycle verification completed 38 executions and finished flat.
+- **Landed:** unauthenticated CoinSwitch Spot market data. The stdlib-only
+  Engine.IO v4 / Socket.IO client subscribes to documented public order-book
+  and public-trade events and exposes the existing ingestion interfaces.
+  `--coinswitch-symbol BTC/USDT` runs that data through the same paper broker and
+  dashboard; it has no credential or order API. The exchange-specific handshake
+  path is required for delivery. Live checks on November 2, 2026 proved BTC/INR
+  book snapshots plus BTC/USDT trades on both USDT venues. Since the documented
+  candle event acknowledged without delivering, exact trade tokens are locally
+  aggregated into one-minute OHLCV; a live closed bar was received successfully.
+  Disconnect recovery now uses bounded exponential backoff while retaining a
+  fail-closed source error. A forced live disconnect recovered, re-subscribed,
+  and resumed newer quotes. The evidence-backed November 3 qualification ran
+  for 150 seconds and received 274 quotes plus three closed candles with zero
+  feed-error polls; reconnect counters and redacted error type are visible in
+  both the report and dashboard snapshot.
+- **Landed:** the offline CoinSwitch Spot order-response contract. It decodes
+  documented JSON with `parse_float=str`, translates every lifecycle status and
+  inventory record into the existing injected `SandboxBroker` boundary, carries
+  `client_order_id`, and refuses overfills, status/quantity contradictions, and
+  account-wide portfolio data masquerading as exchange positions. It contains
+  no host, HTTP client, signer, or credentials. Official material publishes only
+  the production Spot host; no sandbox/testnet endpoint was found.
+- **Landed:** cumulative fill plus terminal lifecycle observations.
+  `BrokerAck.terminal_status` can carry `CANCELED` or `EXPIRED` together with
+  the venue's cumulative quantity. The gateway validates against regression and
+  full-fill contradictions, books only the fill delta, then transitions the
+  order terminal inside the same transaction. CoinSwitch cancelled/expired
+  records with partial fills now flow through instead of being refused or losing
+  exposure.
+- **Landed:** protected marketable LIMIT construction for CoinSwitch paper mode.
+  Buys use the observed ask plus a configurable basis-point cap and round upward;
+  sells use the bid minus the allowance and round downward. Venue price decimals
+  are explicit, all arithmetic is Decimal-only, zero-rounded prices fail closed,
+  and the synthetic application remains on its existing MARKET behavior.
+- **Landed:** injected CoinSwitch market constraints for paper orders. Base
+  quantity is floored to the configured venue step before gateway submission,
+  and orders below/above the configured quote-notional bounds fail closed. The
+  three constraint values are all-or-none; the app does not guess metadata.
+- **Landed:** strict offline CoinSwitch trade-info translation. A captured
+  response is bound to the configured exchange, symbol, and quote currency;
+  base/quote precision and notional bounds become the injected market
+  specification without binary floats. Missing, contradictory, out-of-range,
+  or ambiguously adjusted precision fails closed. The capture path performs no
+  request, signing, or credential handling.
+- **Landed:** versioned metadata capture freshness and integrity checks. The
+  capture binds source path, exchange, symbol, UTC acquisition time, exact
+  response bytes and SHA-256. Stale, future-dated, mismatched, or altered files
+  stop startup. The resulting specification retains its expiry and refuses new
+  orders if a running process crosses it. The checksum is corruption evidence,
+  not a venue signature or protection from a malicious file rewrite.
+- **Landed:** operator visibility and continuous expiry enforcement for market
+  metadata. Dashboard JSON/UI show source, capture time, validity deadline,
+  remaining seconds and fresh/warning/expired state. Expiry contributes an
+  explicit blocked reason, fails health, and stops the complete service cycle;
+  the policy remains a final per-order backstop.
+- **Landed:** redacted transition-only operator alerts. The bounded dashboard
+  feed reports readiness, supervisor, market-data and metadata lifecycle changes
+  once per transition, including recovery, without exposing transport errors or
+  adding a mutation/execution route.
+- **Landed:** reproducible local paper deployment surface. `pyproject.toml`
+  builds a zero-runtime-dependency wheel with the `trading-paper` entrypoint;
+  the example TOML is validated and the CLI refuses live mode or credentials.
+  SIGINT/SIGTERM trigger ordered application cleanup from the main flow, and
+  `--soak-seconds` provides a genuinely paced unattended verification mode.
+- **Landed:** installed-artifact release and restart drill. It verifies wheel
+  checksum/content/dependency absence, installs away from the source tree,
+  starts and health-checks the dashboard, stops with SIGTERM at a flat
+  checkpoint, reopens the same SQLite state, and proves cash/audit/readiness
+  continuity through a second soak. A deliberately open local position remains
+  a reconciliation block after rebuilding the in-memory paper venue.
+- **Landed:** exact-confirmation recovery for that interrupted paper-only case.
+  It refuses open/UNKNOWN orders, non-paper brokers and missing mismatch; adopts
+  the rebuilt venue snapshot via the existing operator reconciliation API,
+  audits before/after plus reason, re-verifies before clearing the latch, then
+  proves a clean rebuild. The installed release drill exercises the hard-kill,
+  blocked restart, recovery and resumed-health sequence end to end.
+- **Landed and executed:** atomic durable soak evidence. Timed runs cannot pass
+  with an open position and align to complete synthetic paths. The November 3,
+  2026 paced qualification completed 247 healthy cycles; the accelerated
+  endurance run completed 10,013 healthy cycles and 32,666 audit records. Both
+  had zero UNKNOWN outcomes, ended flat, and independently matched the SHA-256
+  stored beside their closed SQLite state.
+- **Landed and live-qualified:** finite CoinSwitch public-data evidence.
+  `--coinswitch-observe-seconds` observes without constructing any order path,
+  fails unless quotes and a completed one-minute candle arrive and the stream
+  ends recovered, and atomically records message/error/reconnect totals with
+  explicit no-credentials and live-off markers. The November 3, 2026 BTC/USDT
+  check completed 150 seconds with 274 quotes, three candles, and no feed errors
+  or reconnects. A multi-hour unattended run remains the next operational step.
+- **Not started:** a live or sandbox broker connection. The local read-only
+  HTTP/UI adapter is landed and deliberately has no execution controls.
 
 Live-trading preparation must, across these stages, address: duplicate-order
 prevention, stale market data, broker/API timeouts, unknown order outcomes,
 partial fills, rejections, disconnect/reconnect, process restart, position
 mismatch, rate limits, kill switch, maximum order/position/notional/loss limits,
-and auditability. **Only process restart and durability remain unaddressed** —
-every other item has code and tests behind it now.
+and auditability. Process restart and local transactional durability now have
+code and tests; real network behavior, multi-process ownership, and a production
+database remain deliberately unclaimed.
 
 The intended deployment progression is
 **Backtest → Advisory → Paper Trading → Broker Sandbox → Small Live Deployment.**
@@ -446,43 +552,33 @@ the reasoning in each is what the fix had to satisfy.
    is what keeps the non-reentrant lock from being taken twice on one path.
    Every path that can move the portfolio is serialised against every other,
    so a `submit` weighing its limits cannot read a position mid-change.
-9. **Durability is now partial, and honest about which half.** *(Narrowed
-   again.)* The kernel owns none of its state — orders, positions, and
-   reservations are injected repositories. Two of the three now have **crash-safe
-   on-disk adapters** in `trading/adapters/persistence/durable.py`:
-   `DurableReservationRepository` and `DurablePositionLedger`, stdlib-only, each
+9. **Repository durability now covers orders, reservations, and positions.**
+   The kernel owns none of this state; all three are injected repositories with
+   **crash-safe on-disk adapters** in
+   `trading/adapters/persistence/durable.py`: `DurableOrderStore`,
+   `DurableReservationRepository`, and `DurablePositionLedger`, stdlib-only, each
    writing its whole collection with an atomic `os.replace` and failing *loud*
    (never silently empty) on a corrupt or unrecognised file. They are **opt-in**:
    the default wiring (`build_rig`, the e2e fixtures) stays in-memory, so nothing
    changes for existing code until an operator wires a path in.
-   `tests/test_durable_persistence.py` proves — with real files and a genuine
+   `tests/test_durable_persistence.py` and `tests/test_durable_orders.py` prove —
+   with real files and a genuine
    rebuild-from-disk, not a shared-object rebuild — that an `UNKNOWN` reservation
    (INVARIANT 5), a claimed key (INVARIANT 12), and the position ledger
    (INVARIANT 6 baseline) all survive a true process exit.
 
-   **Orders are deliberately still not durable**, and that is the remaining gap.
-   The gateway persists an order once with `orders.add(order)` at `DRAFT`, then
-   advances it *in place* without calling back into the store, so a durable order
-   store would capture only the `DRAFT` snapshot. Closing it needs either a
-   gateway `update(order)` call at the write-before-send checkpoint or an
-   on-mutation observer on `Order` — both change the execution chokepoint or the
-   core order object, so both are **your call**, not a persistence-layer
-   decision. Activating durable orders would let the recovery *scan* reclassify
-   ambiguous orders after a real restart (today it reads an empty order store and
-   would call every surviving venue order a ghost); the cost is a write on the
-   hot submit path and a serialize/restore contract on `Order` that must not
-   become a way to reconstruct an order in a state the transition table forbids.
+   The gateway now calls `update(order)` at every mutation. Its load-bearing
+   checkpoint persists `PENDING_NEW` before the broker call; fill snapshots are
+   written before portfolio movement to prevent a restart from double-booking a
+   delta. `Order.from_dict` validates fill/state coherence and the complete
+   transition chain, so persistence cannot reopen a forbidden transition.
 
-   One consequence had to be handled for the partial state to be *coherent*: with
-   durable reservations but non-durable orders, a restart leaves an `UNKNOWN`
-   reservation whose order object is gone. `require_clean` sources its UNKNOWN
-   block from the *order* store, which is now empty, so on its own it would let a
-   new order through. The gateway therefore gained a fail-closed backstop,
-   `_require_no_unknown_reservation`, called immediately after `require_clean`:
-   if `dedupe.has_unknown()` it refuses at the RECONCILIATION gate. It can only
-   *add* a refusal, never remove one; in the in-memory default it never fires
-   before `require_clean` already has (order and reservation go UNKNOWN
-   together); and it is what makes INVARIANT 5 survive a real restart. The
+   The earlier reservation-only fallback remains as defence in depth:
+   `_require_no_unknown_reservation`, called immediately after `require_clean`,
+   refuses at the RECONCILIATION gate if `dedupe.has_unknown()`. It covers a
+   deployment that intentionally persists reservations without orders, and can
+   only add a refusal, never remove one. With `DurableOrderStore` wired,
+   `require_clean` normally sees the restored UNKNOWN order first. The
    operational monitor got the matching optional `dedupe` dependency so its
    `ready` predicate does not read `True` off an empty order store while the
    gateway is refusing — a `BlockedReason.UNKNOWN_RESERVATION`.
@@ -605,20 +701,16 @@ the reasoning in each is what the fix had to satisfy.
     owns it. The monitor has no execution surface by construction, and
     `tests/test_operations.py::TestItCannotAct` asserts that absence — including
     `test_it_is_not_a_second_gate`, which shows the monitor reporting un-ready
-    while the *gateway* is what refuses the order. There is no HTTP surface; the
-    architecture has no inbound adapter layer, and adding one would put a network
-    boundary on a system whose safety story is that it has none.
-18. **Order durability is the remaining gap; reservations and positions are
-    durable.** Superseding the earlier "no durability, still" note: item 9 now
-    describes the split. Reservations and positions have crash-safe on-disk
-    adapters; **orders do not**, because the gateway advances them in place with
-    no store callback, so a durable order store would capture only the `DRAFT`
-    snapshot. Until that is closed (an execution-path decision for the operator),
-    the reconciliation sweep after a *real* restart reads an empty local order book
-    and would report every venue order as a ghost — which is why the sweep is
-    fail-*loud* about it rather than silently adopting the venue's book. The
-    UNKNOWN block itself does survive a real restart regardless, via the durable
-    reservation and the gateway's reservation-level backstop.
+    while the *gateway* is what refuses the order. The loopback HTTP adapter now
+    renders this summary, but it is read-only and remains outside the monitor;
+    it cannot turn readiness into authorization or reach the gateway.
+18. **SQLite closes the settlement-transaction gap, but not all restart state.**
+    `SQLiteState` commits orders, reservations, positions, portfolio accounting,
+    and audit rows together around gateway checkpoints and definitive outcomes.
+    The default remains in-memory, while `sqlite_path` opts the paper app into
+    durable daily P&L and rate-window state too. Construction runs startup
+    recovery and a venue sweep; an open-position restart against a fresh paper
+    venue correctly becomes unready because the two position books disagree.
 
 ### One documentation defect, now fixed
 
@@ -647,19 +739,22 @@ reservation-level UNKNOWN backstop, and the monitor's matching readiness check).
 python3 -m unittest discover -s tests -t .
 ```
 
-Result: **`Ran 1875 tests in 2.512s` / `OK`.**
+Result after the protected-LIMIT milestone: **`Ran 2061 tests` /
+`OK`** (four loopback socket tests skip in the restricted sandbox; all seven
+dashboard tests pass when loopback permission is available).
 
 Coverage, via the project's stdlib-`trace` script (the one embedded in
 `docs/ARCHITECTURE.md` §7 — use it, not an ad-hoc approximation):
 
-**TOTAL: 96.5% — 7989 statements, 277 missed.**
+**TOTAL: 95.2% — 10,807 statements, 522 missed.**
 
 | Package | Statements | Missed |
 |---|---|---|
-| `trading/adapters` | 2094 | 51 |
+| `trading/adapters` | 3345 | 184 |
 | `trading/advisory` | 397 | 2 |
-| `trading/core` | 4518 | 185 |
-| `trading/ports` | 241 | 28 |
+| `trading/app` | 1350 | 87 |
+| `trading/core` | 4733 | 210 |
+| `trading/ports` | 243 | 28 |
 | `trading/strategy` | 737 | 11 |
 | `trading/__init__.py` | 2 | 0 |
 
@@ -744,7 +839,7 @@ $ git status --short
 ?? trading/ports/reservation_repository.py
 ```
 
-The suite is green at this state (`Ran 1875 tests` / `OK`), so the tree is
+The suite is green at this state (`Ran 2024 tests` / `OK`), so the tree is
 consistent, not half-edited. No stashes in play, no untracked files besides
 those listed and OS cruft covered by `.gitignore` (which aggressively ignores
 anything credential-shaped — `.env`, `*.key`, `*secret*`, `*token*`,

@@ -448,23 +448,23 @@ requiring an operator to clear each one would turn every hiccup into an outage.
   those positions — `Position.basis_is_known` is the flag to check before
   believing a P&L number. Equity is unaffected, since it needs marks, not basis.
 - **Anything requiring a process boundary** — see capability isolation above.
-- **Durability.** *(Stage 2H, seam built, durability not.)* No state survives
-  **process** exit: no orders, no positions, no audit trail, no idempotency keys.
-  Stage 2H did not change that, and the package named
-  `trading.adapters.persistence` does not either — every implementation in it is
-  a dict behind a lock. What 2H built is the *injection*: the kernel is handed
-  `OrderStore`, `PositionLedger`, and `ReservationRepository` rather than owning
-  them, so state can now outlive the objects that read it even though it cannot
-  yet outlive the process. The practical difference is that the restart question
-  is now testable — `tests/test_restart_recovery_e2e.py` rebuilds the entire
-  stack around surviving repositories and asserts that INVARIANT 5's block and
-  INVARIANT 12's duplicate refusal both hold across the boundary. Read that as
-  evidence about the *wiring*, not about the disk. **A real crash still loses
-  everything, and a crash after an `UNKNOWN` order still loses the block that
-  `UNKNOWN` was providing.** This remains the single largest gap, and closing it
-  needs a repository implementation that writes `PENDING_NEW` before the order is
-  sent — see `trading/ports/repository.py` for why that ordering is the whole
-  problem.
+- **Durability is opt-in and incomplete at the system level.** Orders,
+  reservations, and positions now have crash-safe JSON adapters in
+  `trading.adapters.persistence`. The gateway writes an order as `PENDING_NEW`
+  before the broker call and persists each later mutation; tests reconstruct a
+  fresh kernel from disk and prove that `UNKNOWN` still blocks until gateway
+  reconciliation. The default composition remains in-memory, the audit sink is
+  not durable by default, portfolio cash/cost basis are not persisted, and the
+  three files are not committed as one database transaction. This is a safe
+  local persistence boundary, not production database durability.
+  `SQLiteState` is the stronger opt-in path: gateway checkpoints and settlement
+  writes share one SQLite transaction, including order, reservation, position,
+  portfolio cash/basis, daily-loss ledger, rate-window history, and audit rows.
+  The paper composition can opt in with `sqlite_path` / `--state-db`; every
+  construction runs the recovery scan and an initial venue-wide reconciliation,
+  and the monitor remains unready on ambiguity or mismatch. A restarted in-process
+  paper venue cannot reproduce an open venue position, so an open-position restart
+  correctly blocks rather than treating local persistence as venue truth.
 - **Recovery that runs by itself.** *(Stage 2H.)*
   `RestartRecoveryCoordinator.scan()` will tell an operator which orders are
   ambiguous after a restart — `UNKNOWN`, or `PENDING_NEW` with a `SUBMITTED`
@@ -481,7 +481,8 @@ requiring an operator to clear each one would turn every hiccup into an outage.
 - **Clock trust.** `SystemClock` reads the host clock. A host whose monotonic
   clock is broken defeats every cooldown. Tests prove the code does not depend on
   *wall* clock, which is the failure mode that actually occurs.
-- **Network failure modes.** There is no network, so there is no timeout tuning,
+- **Exchange network failure modes.** The loopback dashboard is observational;
+  there is still no exchange network client, so there is no venue timeout tuning,
   no partial-write handling, and no evidence about how a real venue behaves under
   load. The `UNCERTAIN`-and-raise paths are modelled by `SimulatedBroker`; they
   are not validated against a real exchange.
@@ -654,8 +655,11 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 1 875
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 2,096
    tests in ~2.5 s. There is no reason to run a subset.
+7. **Run the application soak.** `python3 -m trading.app --soak-cycles 190`
+   verifies repeated ingestion, reconciliation, strategy, execution, readiness,
+   UNKNOWN absence, and the audit chain before transport/configuration changes.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the layering these controls sit in and
 for the seams a later stage attaches to.

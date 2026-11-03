@@ -1,0 +1,24 @@
+{
+  "credentials_used": false,
+  "elapsed_seconds": 155.007965,
+  "finished_at": "2026-11-02T21:44:24.606360+00:00",
+  "live_trading": false,
+  "public_data_only": true,
+  "report": {
+    "candle_messages": 3,
+    "duration_elapsed_seconds": 150.00347883400536,
+    "duration_requested_seconds": 150.0,
+    "exchange": "c2c1",
+    "failures": [],
+    "feed_error_polls": 0,
+    "last_feed_error": null,
+    "passed": true,
+    "poll_attempts": 150,
+    "quote_messages": 274,
+    "reconnect_attempts": 0,
+    "successful_reconnects": 0,
+    "symbol": "BTC/USDT"
+  },
+  "schema": "coinswitch-public-observation/v1",
+  "started_at": "2026-11-02T21:41:49.598395+00:00"
+}

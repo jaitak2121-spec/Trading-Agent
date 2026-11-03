@@ -28,14 +28,19 @@ adapter layer, and no infrastructure at all:
   adapter in a later Stage 2H.
 * :mod:`trading.adapters.recovery` -- the restart-recovery scan. It *finds*
   ambiguous orders; resolving one remains an operator act.
+* :mod:`trading.adapters.http` -- the loopback-only, read-only operator
+  dashboard. It observes the assembled application and exposes no mutation or
+  execution route.
 
 Both venues implement :class:`~trading.ports.broker.BrokerPort` and both sit
 behind the one :class:`~trading.core.gateway.ExecutionGateway`. Neither is a
 second execution path, and a third broker adapter would not be either.
 
-**No adapter in this repository performs network I/O.** There is no HTTP client,
-no socket, and no credential use anywhere under this package. That is a standing
-constraint, and ``tests/test_core_purity.py`` checks the import side of it.
+**No adapter in this repository performs outbound or exchange network I/O.**
+The sole socket boundary is the reviewed local dashboard server; it binds to
+loopback by default, has no credentials, and is read-only. There is no HTTP
+client or exchange endpoint. ``tests/test_core_purity.py`` confines the network
+imports to that adapter and SQLite to its persistence adapter.
 
 The dependency arrow points one way: adapters import ports and core; nothing in
 ``trading.core`` or ``trading.ports`` may import this package.

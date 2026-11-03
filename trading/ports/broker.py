@@ -115,12 +115,18 @@ class BrokerOrderSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class BrokerAck:
-    """A venue's response to a placement attempt."""
+    """A venue response or cumulative lifecycle observation.
+
+    ``terminal_status`` preserves the combination "some quantity filled, then
+    the remainder was cancelled/expired". Without it an adapter must lose
+    either the fill or the terminal state.
+    """
 
     outcome: AckOutcome
     broker_order_id: str | None = None
     filled_quantity: Quantity | None = None
     fill_price: Price | None = None
+    terminal_status: BrokerOrderStatus | None = None
     message: str = ""
 
     def __post_init__(self) -> None:
@@ -138,6 +144,24 @@ class BrokerAck:
             raise TypeError("filled_quantity must be a Quantity")
         if self.fill_price is not None and not isinstance(self.fill_price, Price):
             raise TypeError("fill_price must be a Price")
+        if self.terminal_status is not None:
+            if self.terminal_status not in {
+                BrokerOrderStatus.CANCELED,
+                BrokerOrderStatus.EXPIRED,
+            }:
+                raise ValueError("terminal_status must be CANCELED or EXPIRED")
+            if self.outcome not in {AckOutcome.ACCEPTED, AckOutcome.FILLED}:
+                raise ValueError(
+                    "a terminal lifecycle observation must be ACCEPTED or FILLED"
+                )
+            if self.filled_quantity is None:
+                raise ValueError(
+                    "a terminal lifecycle observation must carry cumulative quantity"
+                )
+            if self.outcome is AckOutcome.ACCEPTED and not self.filled_quantity.is_zero:
+                raise ValueError(
+                    "a terminal observation with fills must use FILLED outcome"
+                )
 
     @property
     def is_uncertain(self) -> bool:
@@ -151,6 +175,9 @@ class BrokerAck:
                 str(self.filled_quantity.amount) if self.filled_quantity else None
             ),
             "fill_price": str(self.fill_price.amount) if self.fill_price else None,
+            "terminal_status": (
+                self.terminal_status.value if self.terminal_status else None
+            ),
             "message": self.message,
         }
 

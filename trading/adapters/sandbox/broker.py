@@ -262,6 +262,15 @@ class SandboxBroker(BrokerPort, BrokerOrderInventoryPort):
                 "side": order.side.value,
                 "quantity": str(order.intent.quantity.amount),
                 self._ASSET_FIELD: order.intent.quantity.asset,
+                "order_type": order.intent.order_type.value,
+                **(
+                    {
+                        "limit_price": str(order.intent.limit_price.amount),
+                        self._QUOTE_FIELD: order.intent.limit_price.currency.code,
+                    }
+                    if order.intent.limit_price is not None
+                    else {}
+                ),
             },
         )
 
@@ -499,12 +508,36 @@ class SandboxBroker(BrokerPort, BrokerOrderInventoryPort):
 
         broker_order_id = self._optional_str(response.body, self._ID_FIELD)
         if status in (BrokerOrderStatus.CANCELED, BrokerOrderStatus.EXPIRED):
-            # Terminal and unfilled. The venue no longer holds it, which for a
-            # reconciliation read is the same answer as having no record.
+            filled_raw = response.body.get(self._FILLED_FIELD)
+            if filled_raw in (None, ""):
+                if not order.filled_quantity.is_zero:
+                    raise TransportMalformed(
+                        f"venue reports {status.value} without cumulative fill "
+                        "quantity for an order with locally booked fills"
+                    )
+                quantity = Quantity.zero(order.intent.quantity.asset)
+            else:
+                quantity = self._require_quantity(
+                    response.body,
+                    self._FILLED_FIELD,
+                    asset=order.intent.quantity.asset,
+                )
+            if quantity.is_zero:
+                return BrokerAck(
+                    AckOutcome.ACCEPTED,
+                    broker_order_id=broker_order_id,
+                    filled_quantity=quantity,
+                    terminal_status=status,
+                    message=f"venue reports the order {status.value}",
+                )
+            price = self._require_price(response.body, self._PRICE_FIELD)
             return BrokerAck(
-                AckOutcome.REJECTED,
+                AckOutcome.FILLED,
                 broker_order_id=broker_order_id,
-                message=f"venue reports the order {status.value}",
+                filled_quantity=quantity,
+                fill_price=price,
+                terminal_status=status,
+                message=f"partially filled, then {status.value}",
             )
         if status is BrokerOrderStatus.REJECTED:
             return BrokerAck(

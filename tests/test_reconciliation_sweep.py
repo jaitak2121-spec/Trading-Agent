@@ -135,6 +135,15 @@ class TestCleanSweeps(SweepCase):
         self.assertEqual(report.findings, ())
         self.assertEqual(report.venue_order_count, 0)
 
+    def test_a_position_discrepancy_is_a_blocking_sweep_finding(self) -> None:
+        self.rig.positions.set_position(SYMBOL, Quantity("1", ASSET))
+
+        report = self.coordinator.sweep()
+
+        self.assertIn(FindingKind.QUANTITY_MISMATCH, self.kinds(report))
+        self.assertTrue(report.blocked)
+        self.assertTrue(self.rig.reconciliation.has_mismatch)
+
     def test_a_resting_order_matches_and_is_synced(self) -> None:
         order = self.rest()
         report = self.coordinator.sweep()

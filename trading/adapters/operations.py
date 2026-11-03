@@ -30,12 +30,9 @@ authority, takes no order, and is not on any path a submission travels.
 What it deliberately is not
 ===========================
 
-**Not a service.** There is no HTTP server, no route, no framework. The
-architecture has no inbound adapter layer, and inventing one here to "expose"
-status would put a network surface on a system whose whole safety story is that
-it has none. An operator reads this in-process, or a future inbound adapter
-reads it and renders it -- but that adapter does not exist yet, and this module
-does not pretend to be it.
+**Not a service.** This module has no HTTP server or route. The reviewed
+loopback inbound adapter reads and renders this status, but remains separate so
+the monitor itself cannot acquire a network or execution surface.
 
 **Not a metrics backend.** Counters are observational and derived from what the
 components already track. Nothing here is load-bearing for a safety decision,

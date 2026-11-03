@@ -76,6 +76,9 @@ class PollNote:
     order_id: str
     reason: str
 
+    def as_details(self) -> dict[str, str]:
+        return {"order_id": self.order_id, "reason": self.reason}
+
 
 @dataclass(frozen=True, slots=True)
 class PollReport:
@@ -94,9 +97,24 @@ class PollReport:
     failed: tuple[PollNote, ...] = ()
 
     @property
+    def healthy(self) -> bool:
+        """Whether every candidate synchronized without refusal or failure."""
+        return not self.refused and not self.failed
+
+    @property
     def considered(self) -> int:
         """How many open orders this sweep offered to the gateway."""
         return len(self.synced) + len(self.refused) + len(self.failed)
+
+    def as_details(self) -> dict[str, object]:
+        """Return an observation-safe representation made of JSON values."""
+        return {
+            "considered": self.considered,
+            "synced": list(self.synced),
+            "refused": [note.as_details() for note in self.refused],
+            "failed": [note.as_details() for note in self.failed],
+            "healthy": self.healthy,
+        }
 
 
 class LifecyclePoller:

@@ -265,6 +265,10 @@ class PnlLedger:
         self._lock = threading.RLock()
 
     @property
+    def base_currency(self):
+        return self._currency
+
+    @property
     def day(self) -> dt.date:
         with self._lock:
             self._maybe_roll_over()
@@ -378,6 +382,7 @@ class RiskEngine:
         audit: AuditLog,
         clock: Clock,
         approval_ttl_seconds: int = 30,
+        pnl_ledger: PnlLedger | None = None,
     ) -> None:
         authorize(identity, Action.APPROVE_ORDER)
         if is_authorized(identity, Action.EXECUTE_ORDER):
@@ -399,7 +404,14 @@ class RiskEngine:
         self._audit = audit
         self._clock = clock
         self._ttl = approval_ttl_seconds
-        self._pnl = PnlLedger(config.base_currency, clock=clock)
+        if pnl_ledger is not None and not isinstance(pnl_ledger, PnlLedger):
+            raise TypeError("pnl_ledger must be a PnlLedger")
+        if (
+            pnl_ledger is not None
+            and pnl_ledger.base_currency != config.base_currency
+        ):
+            raise ValueError("pnl_ledger currency must match the risk config")
+        self._pnl = pnl_ledger or PnlLedger(config.base_currency, clock=clock)
         self._submissions: deque[float] = deque()
         self._lock = threading.RLock()
 

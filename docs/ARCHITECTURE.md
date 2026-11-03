@@ -17,8 +17,10 @@ Referenced from `trading/__init__.py`.
 Stage 1 is **the dependency-independent safety core and nothing else**. The
 whole package imports only the Python standard library. There is:
 
-- no network I/O — no HTTP client, no socket, no exchange client
-- no database — no PostgreSQL, no ORM, no migration
+- no outbound/exchange network I/O — the only socket is the reviewed,
+  loopback-only, read-only operator dashboard adapter
+- no database code in the kernel — Stage 2 now has one stdlib SQLite adapter at
+  `trading.adapters.persistence.sqlite`; no ORM or external driver
 - no web framework — no FastAPI, no React, no HTTP route
 - no third-party dependency of any kind, including in the test suite
 - no live trading; `TradingMode.LIVE` exists and is guarded, but no adapter
@@ -219,10 +221,10 @@ would convert "we could not find out" into "nothing to worry about".
 since `authorize` refuses *without* auditing and a swallowed one would leave a
 misconfigured poller sweeping nothing forever with no trace.
 
-`trading.adapters.persistence` (113 statements) is **Stage 2H**, and the name
-overpromises twice.
-First, nothing here writes to a disk or a database — every implementation is a
-dict behind a lock. Second, only two of the three exports are actually adapters:
+`trading.adapters.persistence` is **Stage 2H**. Its default adapters remain
+in-memory; `durable.py` supplies opt-in atomic-file implementations, and
+`sqlite.py` supplies a shared transactional database for orders, reservations,
+positions, portfolio accounting, and audit records:
 
 ```python
 # trading/adapters/persistence/__init__.py
@@ -253,10 +255,23 @@ What 2H does buy, and buys for all three entities, is the *injection*. Before it
 `IdempotencyRegistry` owned a `dict` and `OrderStore` owned a `dict`, so there
 was no seam at which state could outlive the object holding it. Now the kernel
 holds a repository it was handed, and a restart means rebuilding the kernel
-around repositories that were *not* rebuilt. That is a weaker claim than
-durability and a strictly necessary step toward it: the question "does
-INVARIANT 5 survive a restart" can now be asked and answered without a database
-existing, and the answer is tested rather than assumed.
+around repositories that were *not* rebuilt. The durable implementations now
+carry that seam across a real process boundary: the question "does INVARIANT 5
+survive a restart" is answered from disk rather than from shared objects.
+
+`DurableOrderStore` serializes the complete order snapshot and transition
+history. The gateway calls `update(order)` after every lifecycle mutation, with
+the load-bearing `PENDING_NEW` update occurring before `BrokerPort.place_order`.
+For fills, the order's cumulative fill is persisted before the portfolio moves,
+so a crash cannot make restart synchronization book the same delta twice. A
+corrupt or incoherent file fails startup rather than being treated as empty.
+
+`SQLiteState.transaction()` is re-entrant: repository writes join the outer
+gateway transaction. The gateway commits the write-before-send checkpoint
+before calling the broker, then commits the definitive order result, reservation
+state, position, cash/basis and audit records together. Broker calls never occur
+inside a database transaction. SQLite is the only database import allowed by the
+purity test, and only in this adapter module.
 
 `trading.adapters.recovery` (50 statements) is the operator's side of that.
 `RestartRecoveryCoordinator`
@@ -509,17 +524,28 @@ An uncertain answer produces `UNKNOWN` and stops the system.
 
 ## 7. Tests
 
-Stdlib `unittest` only. There is no pytest, no `requirements.txt`, and no
-`pyproject.toml` declaring a dependency — `test_core_purity.py` asserts that too.
+Stdlib `unittest` only. There is no pytest or `requirements.txt`.
+`pyproject.toml` declares an installable console application with an empty
+runtime dependency list; `test_core_purity.py` continues to enforce stdlib-only
+source and tests.
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
 
-1 875 tests, ~2.5 s, 96.5% statement coverage (7 989 statements, 277 missed).
+2,096 tests pass in the current working tree. Current stdlib-`trace` coverage is
+95.2% (10,807 executable statements, 522 missed).
 
 | Module | Tests | Covers |
 |---|---:|---|
+| `test_app_deployment.py` | 4 | Dependency-free console packaging, paper-only example profile, SIGINT/SIGTERM restoration, and live-profile refusal |
+| `test_app_release.py` | 3 | Wheel metadata/checksum/dependency verification and deterministic SQLite stop/rebuild/recovery continuity |
+| `test_app_runtime.py` | 5 | Coordinated synthetic quote/bar streaming, continuous application composition, supervised cycles, complete entry/exit execution, and shutdown ownership |
+| `test_app_supervisor.py` | 5 | Immediate scheduling, duplicate-worker refusal, clean/idempotent shutdown, configuration validation, and redacted fail-visible worker errors |
+| `test_app_dashboard.py` | 10 | JSON-safe operator snapshots, metadata-expiry readiness, transition alerts, audit limiting, loopback-only binding, read-only HTTP routes, health response, security headers, and mutation refusal |
+| `test_app_soak.py` | 7 | Repeatable and wall-clock-paced whole-application soak verification, atomic checksum evidence, flat-end qualification, entry/exit and audit proof, operational-block failure, validation, and CLI exit behavior |
+| `test_coinswitch_observation.py` | 5 | Finite public-data qualification, quote/candle proof, recovered and terminal feed failure handling, atomic credential-free evidence, and CLI validation |
+| `test_paper_service.py` | 13 | The complete quote/bar ingestion → venue reconciliation → lifecycle sync → strategy → sizing → gateway cycle; blocking reconciliation/disconnect/gap/malformed-data refusal; no repeated decision without a newly closed bar; in-progress-bar filtering; missing instrument metadata; sizing refusal; and enter/exit round trip |
 | `test_paper_broker.py` | 143 | Fills at the crossed side, slippage against the order, partial fills, every refusal, a resting order re-decided against the current book, and every gate still refusing with the paper venue behind it |
 | `test_marketdata.py` | 95 | Quote/candle validation, staleness, the frozen-feed refusal |
 | `test_gateway.py` | 89 | Each gate's refusal, and the chain ordering |
@@ -632,9 +658,17 @@ Every seam is already named. Nothing in `trading.core` changes.
 |---|---|---|
 | PostgreSQL persistence | `OrderRepositoryPort`, `PositionRepositoryPort`, `ReservationRepositoryPort` | **Seam widened in Stage 2H.** All three ports now have in-memory implementations that the kernel is *injected* with rather than owning, so a database adapter is a fourth implementation and not a kernel change. Two warnings carry forward. Restoring quantities alone is safe but leaves the cost basis unknown, so the basis needs persisting too if P&L attribution is to survive a restart. And a real adapter must write `PENDING_NEW` *before* the order is sent: the in-memory stores satisfy that trivially because they have no commit step, which is exactly why they cannot prove a database adapter does. |
 | Restart recovery wiring | `RestartRecoveryPort` | **Landed, unwired.** `trading.adapters.recovery.RestartRecoveryCoordinator.scan()` reports ambiguous orders after a restart, and `sync_order` / `resolve_unknown` delegate to the gateway. Nothing calls `scan()` at startup, because there is still no startup — the same gap the lifecycle poller has, and for the same reason: see the FastAPI row. |
-| CoinSwitch REST client | `BrokerPort` | Must demand an `ExecutionToken`. `PaperBroker` is the reference for the shape of an honest ack; `SimulatedBroker` is the reference for the failure modes a real client will actually hit. Unlike either, a network client *can* be genuinely in doubt, so it must answer `UNCERTAIN` rather than guess. |
-| Periodic lifecycle polling | `ExecutionGateway.sync_order` | **Landed.** `trading.adapters.lifecycle.LifecyclePoller` sweeps `open_orders()` and hands each one to `sync_order` under a `Principal` holding `Action.RECONCILE` — held by `Role.SYSTEM` for exactly this, so the poller needed no new permission. `poll_once()` is the whole behaviour and is synchronous; `start`/`stop` add only a daemon thread on an interval. Note that at the paper venue fill timing *is* poll timing, since nothing there advances on its own, so the interval is the fill granularity. What remains is *wiring*: nothing constructs a poller at startup, because there is no startup — see §8's FastAPI row. |
-| Live price feed | `QuoteFeedPort` | Publish timestamped `Quote`s; wrap in `FreshMarkPrices` so staleness becomes a risk refusal. |
+| CoinSwitch REST client | `BrokerPort` | **Offline response contract landed; network deliberately absent.** `CoinSwitchSpotResponseTranslator` decodes documented order envelopes with float-free financial tokens and maps the full Spot lifecycle into `SandboxBroker`'s injected transport shape. `BrokerAck.terminal_status` preserves cancelled/expired observations alongside cumulative fills; the gateway books the delta before terminal transition and refuses regressions or a terminal claim against a fully filled order. CoinSwitch publishes only its production Spot host and real-account keys, not a sandbox/testnet host; no signer, credential holder, base URL, or HTTP order method is present. Any future client must demand an `ExecutionToken`, return `UNCERTAIN` on ambiguous writes, and never retry placement automatically. |
+| Periodic lifecycle polling | `ExecutionGateway.sync_order` | **Landed.** `trading.adapters.lifecycle.LifecyclePoller` sweeps `open_orders()` and hands each one to `sync_order` under a `Principal` holding `Action.RECONCILE`. The paper composition now runs recovery plus an initial venue sweep at startup; continuous poller wiring remains for the real-time service loop. |
+| Live price feed | `QuoteFeedPort` | **Public CoinSwitch Spot stream landed.** `CoinSwitchSpotStream` performs the Engine.IO v4 / Socket.IO handshake on the exchange-specific path and subscribes to documented book and public-trade events. Quotes come from full book snapshots. Exact trade tokens are parsed without binary floats and aggregated into closed one-minute OHLCV bars, avoiding the venue candle event that acknowledged but did not deliver in live checks. Disconnects remain visible to both ingestion sources during bounded exponential reconnect; partial bars are discarded, and the error clears only after handshake plus re-subscription succeeds. Counters and redacted error type are exposed in the operator snapshot. It contains no order or credential surface. |
+| CoinSwitch order policy | `RealtimePaperService` → `OrderIntent` | **Venue-constrained marketable LIMIT construction landed for CoinSwitch paper mode.** `MarketableLimitPolicy` caps buys above the observed ask and floors sells below the bid by an explicit basis-point allowance, rounding in the conservative direction to configured venue price decimals. An injected `VenueMarketSpecification` floors base quantity to the venue step without increasing exposure and refuses zero-rounded quantities or quote notionals below/above the configured bounds. `CoinSwitchTradeInfoTranslator` strictly converts a versioned offline capture for the exact exchange/symbol/currency without float arithmetic. The envelope binds source path, capture time and payload checksum; stale/future/mismatched captures stop startup, while the propagated expiry prevents orders after a running app crosses the age limit. Malformed, contradictory, or ambiguously adjusted precision fails closed. Synthetic mode remains MARKET; every resulting intent still traverses the gateway. Transition-based operator alerts remain next; values are never guessed. |
+| Operator metadata status | `OperatorDashboard` | **Landed.** Captured source, acquisition time, expiry, remaining seconds, and `fresh`/`warning`/`expired` state are exposed in the JSON snapshot and local UI. The warning begins in the final quarter of the capture lifetime, capped at six hours. Expiry adds `market_metadata_expired` to effective blocked reasons, makes `/healthz` unavailable, and independently blocks the service cycle; the dashboard still holds no execution authority. |
+| Operator transition alerts | `OperatorDashboard` | **Landed.** A bounded in-memory alert feed records only state changes for readiness, supervisor health, market-data connectivity, and metadata warning/expiry/refresh. Static redacted messages prevent exception details from leaking; repeated snapshot polling creates no duplicate. The JSON/UI remains read-only and alerts carry no execution authority. |
+| Local deployment | `pyproject.toml`, `config/paper.example.toml`, `trading.adapters.process` | **Landed.** Python 3.11+ builds a dependency-free wheel and `trading-paper` console command. Strict TOML profiles may supply paper risk limits but the CLI refuses live mode and credentials. SIGINT/SIGTERM only set an idempotent event; cleanup remains in application control flow. `--soak-seconds` paces full safety cycles over real wall time. |
+| Release/restart drill | `scripts/release_drill.py`, `trading.app.release`, `trading.app.restart_drill` | **Landed.** The drill builds and hashes the wheel, verifies its dependency-free metadata and entrypoint, installs the artifact away from the source tree, health-checks the loopback dashboard, terminates at a flat checkpoint, restarts on the same SQLite state, and runs recovery cycles. An open-position interruption remains blocking because a rebuilt in-memory paper venue cannot truthfully reproduce prior venue inventory. |
+| Interrupted paper recovery | `trading.app.paper_recovery` | **Landed, paper-only and destructive by design.** After a hard interruption leaves a persisted local position that a rebuilt ephemeral `PaperBroker` cannot claim, restart remains blocked. An operator must supply an exact confirmation and audited reason; recovery refuses open/UNKNOWN orders and non-paper brokers, adopts the fresh paper-venue snapshot through the existing reconciliation gate, explicitly clears the latch after re-verification, closes, and proves a clean rebuild. No equivalent is exposed for CoinSwitch or live mode. |
+| Soak evidence | `trading.adapters.soak_evidence` | **Landed and qualified.** Evidence JSON is atomically replaced after persistence closes and binds the redacted report to the final SQLite byte size and SHA-256. Timed synthetic runs align to complete 19-cycle paths and any remaining position fails qualification. The recorded 247-cycle paced run and 10,013-cycle accelerated endurance run both ended flat with zero UNKNOWN outcomes and matching database hashes. |
+| Public-data observation evidence | `trading.app.coinswitch_observation`, `trading.adapters.observation_evidence` | **Landed and live-qualified.** A finite CLI mode counts public quotes, completed trade-derived candles, feed-error polls and reconnects, stops the stream, and atomically records credential-free evidence. It fails for missing channels, incomplete duration, startup failure, or an unrecovered terminal outage. A 150-second BTC/USDT run received 274 quotes and three closed candles with zero feed errors or reconnects. |
 | FastAPI | A new inbound adapter under `trading.adapters` | Calls `ExecutionGateway.submit`; never bypasses it. An *advisory* endpoint calls `Advisor.advise` instead and needs no gateway at all — the two halves of the API are wired to different layers. |
 | Durable audit | `AuditSink` | See "Tamper evidence is not tamper proofing" in `SAFETY.md`. |
 | Real strategies | `trading.strategy` | Subclass `Strategy`; the runner's tripwire applies. |

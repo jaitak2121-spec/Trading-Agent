@@ -1,0 +1,31 @@
+{
+  "elapsed_seconds": 163.745666,
+  "finished_at": "2026-11-02T21:28:20.675737+00:00",
+  "live_trading": false,
+  "mode": "paper",
+  "report": {
+    "audit_records": 32666,
+    "cycles_completed": 10013,
+    "cycles_requested": 10013,
+    "duration_elapsed_seconds": null,
+    "duration_requested_seconds": null,
+    "executed": 2106,
+    "failures": [],
+    "final_cash": "128120.43 USD",
+    "healthy_cycles": 10013,
+    "not_sized": 0,
+    "open_positions": 0,
+    "passed": true,
+    "realized_pnl": "28125.36 USD",
+    "refused": 0,
+    "total_orders": 2106,
+    "unknown": 0
+  },
+  "schema": "paper-soak-evidence/v1",
+  "started_at": "2026-11-02T21:25:36.930071+00:00",
+  "state_database": {
+    "filename": "endurance-state.sqlite3",
+    "sha256": "686a5c568f109827b4bbb31fb0ad02d48aada7f1380c11e3a4a9b87cd4059db2",
+    "size_bytes": 27381760
+  }
+}

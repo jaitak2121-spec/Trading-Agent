@@ -722,7 +722,7 @@ simultaneously.
 The repository currently reports:
 
 ``` text
-Full suite: 1477 tests passing
+Full suite: 2,024 tests passing in the current working tree
 ```
 
 Phase 1 introduced lifecycle primitives including:
@@ -1198,11 +1198,202 @@ oversight.
 
 ## Development Status
 
-**Current focus:** Reliable order lifecycle and cancellation
-reconciliation.
+**Current focus:** CoinSwitch paper-order compatibility and sandbox execution
+research.
 
-**Current reported test status:** `1477 tests passing`.
+**Current reported test status:** `2,096 tests passing` (`4` loopback socket
+tests are skipped when the environment forbids local binds).
 
-**Next major milestone:** Complete Phase 2 cancellation lifecycle,
-regression tests, and verification before expanding into higher-level
-AI, UI, and production broker functionality.
+**Current integrated milestone:** `RealtimePaperService.poll_once()` now performs
+one deterministic operational cycle: ingest and validate quotes and closed bars,
+synchronize prior order lifecycle state, fail closed on startup/data/lifecycle
+findings, build a freshness-filtered strategy context, size signals, and submit
+only through the existing execution gateway. It does not contain a network
+client or a second execution route.
+
+The local paper product is runnable with a supervised synthetic stream and a
+loopback-only, read-only operator dashboard:
+
+```bash
+python3 -m trading.app --dashboard --state-db ./paper-state.sqlite3
+```
+
+Open `http://127.0.0.1:8765/`. The dashboard exposes status, readiness, cash,
+positions, orders, audit history, and the last service cycle. Synthetic data is
+clearly identified; live trading remains off.
+
+For a reproducible local install, use Python 3.11+ and the dependency-free
+package definition:
+
+```bash
+python3.11 -m pip install .
+trading-paper --config config/paper.example.toml \
+  --dashboard --state-db ./paper-state.sqlite3
+```
+
+The example TOML contains reviewed paper-risk limits only. The CLI rejects live
+mode and API credentials in application profiles. `SIGINT` and `SIGTERM` request
+the same ordered shutdown of dashboard, supervisor, stream, and persistence.
+For a paced unattended soak—for example, six hours—run:
+
+```bash
+trading-paper --config config/paper.example.toml \
+  --soak-seconds 21600 --poll-interval 1 \
+  --state-db ./paper-soak.sqlite3
+```
+
+Before treating a wheel as releasable, run the automated installed-artifact
+drill:
+
+```bash
+python3.11 scripts/release_drill.py --python python3.11
+```
+
+It builds and SHA-256 verifies the wheel, confirms there are no runtime
+dependencies, installs it into an isolated target, checks the console command,
+starts and health-checks the dashboard, waits for a flat checkpoint, sends
+`SIGTERM`, restarts on the same SQLite state, and performs a second deterministic
+recovery soak. Stopping during an open paper position is deliberately not called
+a clean restart: the rebuilt in-memory paper venue cannot claim the old venue
+position, so reconciliation correctly blocks it.
+
+For that paper-only interruption case, the operator may explicitly adopt the
+rebuilt in-memory paper venue (normally an empty position snapshot):
+
+```bash
+trading-paper \
+  --recover-paper-position ./paper-state.sqlite3 \
+  --confirm-paper-position-reset I_ACCEPT_PAPER_VENUE_POSITION_RESET \
+  --paper-recovery-reason "discard interrupted local paper position after venue reset"
+```
+
+This deliberately overwrites the persisted **paper position**, records the old
+and adopted values in the audit chain, clears the mismatch only after a fresh
+comparison, closes the database, and verifies a clean rebuild. It refuses wrong
+confirmation, empty reason, open/UNKNOWN orders, non-paper brokers, and states
+without a mismatch. It is not available for CoinSwitch or live execution.
+
+The same paper stack can consume CoinSwitch's unauthenticated Spot WebSocket
+stream. Prices and candles are real venue data, but every order still goes only
+to the in-process `PaperBroker`:
+
+```bash
+python3 -m trading.app --coinswitch-symbol BTC/USDT --state-db ./coinswitch-paper.sqlite3
+```
+
+CoinSwitch paper orders are venue-compatible LIMIT intents rather than MARKET
+intents (the documented Spot API supports LIMIT only). By default a buy is
+capped 10 basis points above the current ask and rounded upward to two price
+decimals; a sell is floored 10 basis points below the bid and rounded downward.
+Use `--limit-protection-bps` and `--limit-price-decimals` to match the selected
+market's published precision. These are hard execution bounds, not estimates.
+The optional venue specification also floors the base quantity to its published
+step and refuses orders outside the published quote-notional range. All three
+constraint flags must be supplied together, using exact metadata for the chosen
+market rather than guessed values:
+
+```bash
+python3 -m trading.app --coinswitch-symbol BTC/USDT \
+  --quantity-step <base-step> \
+  --min-order-notional <quote-min> \
+  --max-order-notional <quote-max>
+```
+
+Prefer a versioned offline capture of CoinSwitch's documented
+`/trade/api/v2/tradeInfo` response when one is available:
+
+```bash
+python3 -m trading.app --coinswitch-symbol BTC/USDT \
+  --coinswitch-market-info-file ./btc-usdt-trade-info.json
+```
+
+The capture envelope is `coinswitch-trade-info-capture/v1`. It records the exact
+exchange, symbol, UTC `captured_at`, source path, base64-encoded response bytes,
+and their SHA-256 checksum. The default maximum age is 24 hours; use
+`--market-info-max-age-hours` within 1–720 hours when an explicit operating
+policy requires a different window. Stale, future-dated, mismatched, corrupt,
+or unsupported captures stop startup. The expiry also travels with the venue
+specification, so an already-running app refuses new orders after it expires.
+
+The offline translator derives base step and price decimals and validates
+min/max quote notional. It rejects malformed precision, contradictory bounds,
+and the currently ambiguous non-zero `precision.limit` adjustment. The capture
+replaces the three manual constraint flags and must not contain credentials.
+The checksum detects accidental payload corruption; it is not a CoinSwitch
+digital signature and does not authenticate a maliciously rewritten file.
+
+This mode contains no CoinSwitch credentials or order transport. Exchange
+selection is constrained to the venue's documented market split:
+`coinswitchx` for INR and `c2c1`/`c2c2` for USDT. The November 2, 2026 live
+smoke check received BTC/INR book snapshots and BTC/USDT trade prints. Because
+the venue's candlestick event acknowledged but did not deliver, the adapter
+builds exact one-minute OHLCV bars from public trades; a live closed BTC/USDT
+bar was verified end to end. No binary floating-point value enters financial
+calculation.
+
+The stream reconnects with bounded exponential backoff. While disconnected its
+sources retain and surface the transport error, so ingestion remains fail-closed;
+after a verified re-subscription the error clears and delivery resumes. Partial
+trade bars are discarded across a disconnect rather than joined over an unknown
+gap. Reconnect attempts, successful recoveries, and the redacted error type are
+available in the dashboard snapshot. A finite, credential-free qualification
+can now write atomic JSON evidence and exits non-zero unless it observes both
+order-book quotes and a completed one-minute candle, completes the requested
+duration, and finishes with the feed recovered:
+
+```bash
+trading-paper --coinswitch-symbol BTC/USDT --coinswitch-exchange c2c1 \
+  --coinswitch-observe-seconds 14400 --poll-interval 1 \
+  --observation-report ./artifacts/public-market-observation.json
+```
+
+The November 3, 2026 bounded live qualification ran for 150.003 seconds and
+received 274 quotes plus three closed candles with zero feed-error polls or
+reconnects. Its `coinswitch-public-observation/v1` evidence explicitly records
+public-data-only operation, no credentials, and live trading off.
+
+Run a fast, repeatable end-to-end safety soak before changing a transport or
+configuration:
+
+```bash
+python3 -m trading.app --soak-cycles 190
+```
+
+It exits non-zero if a cycle is unhealthy, reconciliation blocks, UNKNOWN
+execution remains, readiness is false, or the audit chain fails.
+
+CoinSwitch's official documentation currently publishes only the production
+Spot host and real-account API-key flow; it does not publish a sandbox/testnet
+host. Accordingly, no authenticated HTTP transport was added. The offline
+`CoinSwitchSpotResponseTranslator` now maps the documented order envelopes and
+all lifecycle states into the injected sandbox boundary, preserves financial
+JSON tokens without binary floats, and refuses contradictory data. The broker
+observation contract now preserves a cumulative partial fill together with a
+terminal cancelled/expired state. The gateway books only the fill delta first,
+then makes the terminal transition atomically, so neither exposure nor venue
+truth is lost.
+
+The dashboard also retains a bounded, in-memory, transition-only alert feed for
+readiness blocking/restoration, market-data loss/recovery, metadata
+warning/expiry/refresh, and supervisor failure/recovery. Repeated polling does
+not duplicate alerts, messages are redacted, and the surface remains read-only.
+
+The November 3, 2026 durable qualification produced two checksum-backed evidence
+artifacts under `artifacts/`:
+
+- `qualification-soak-2026-11-03.json`: 62.401 seconds, 247/247 healthy paced
+  cycles, 50 executions, zero UNKNOWN outcomes, zero open positions, 798 audit
+  records, and a matching SQLite SHA-256.
+- `endurance-soak-2026-11-03.json`: 10,013/10,013 healthy cycles (527 complete
+  strategy paths, about seven days of synthetic one-minute market time), 2,106
+  executions, zero UNKNOWN outcomes, zero open positions, 32,666 audit records,
+  and a matching SQLite SHA-256.
+
+Timed qualification rounds to complete synthetic strategy paths and refuses to
+pass with any open position. Evidence is written atomically only after the
+database closes and includes its final filename, byte size, and hash.
+
+**Next major milestone:** Run the new evidence command unattended for multiple
+hours, then obtain written CoinSwitch confirmation of a non-production test
+environment before adding authenticated transport. The local paper product is
+feature-complete; production execution remains deliberately absent.

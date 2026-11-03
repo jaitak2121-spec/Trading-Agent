@@ -292,6 +292,19 @@ class ReconciliationCoordinator:
             symbols: tuple[str, ...] = ()
         else:
             symbols = report.symbols_checked
+            for discrepancy in report.discrepancies:
+                findings.append(
+                    ReconciliationFinding(
+                        kind=FindingKind.QUANTITY_MISMATCH,
+                        severity=FindingSeverity.BLOCKING,
+                        detail=(
+                            f"position mismatch for {discrepancy.symbol}: "
+                            f"local={discrepancy.local.amount} "
+                            f"venue={discrepancy.remote.amount} "
+                            f"difference={discrepancy.difference.amount}"
+                        ),
+                    )
+                )
 
         synced: list[str] = []
         for order in syncable:

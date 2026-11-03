@@ -291,14 +291,21 @@ class AuditLog:
         *,
         clock: Clock | None = None,
         redactor: Redactor | None = None,
+        initial_records: Sequence[AuditRecord] | None = None,
     ) -> None:
         self._sink = sink if sink is not None else InMemoryAuditSink()
         self._clock = clock if clock is not None else SystemClock()
         self._redactor = redactor if redactor is not None else global_redactor()
         self._lock = threading.RLock()
+        restored = list(initial_records or ())
         self._seq = 0
         self._last_hash = GENESIS_HASH
         self._chain: list[AuditRecord] = []
+        if restored:
+            self.verify(restored)
+            self._chain = restored
+            self._seq = restored[-1].seq
+            self._last_hash = restored[-1].record_hash
 
     @property
     def sink(self) -> AuditSink:

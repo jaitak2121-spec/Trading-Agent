@@ -1,0 +1,15 @@
+# Copy to config.local.toml and adjust only reviewed paper-risk limits.
+# Local profiles and secrets are ignored by git. Live trading and API
+# credentials are deliberately forbidden by the application CLI.
+
+[trading]
+environment = "paper"
+live_trading = false
+base_currency = "USD"
+max_order_notional = "50000.00"
+max_position_notional = "100000.00"
+max_gross_exposure = "200000.00"
+max_daily_loss = "2000.00"
+max_orders_per_minute = 60
+max_open_orders = 5
+risk_fraction_per_trade = "0.001"

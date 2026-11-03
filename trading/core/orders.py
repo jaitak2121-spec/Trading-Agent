@@ -147,6 +147,7 @@ ORDER_TRANSITIONS: Final[Mapping[OrderState, frozenset[OrderState]]] = {
             OrderState.FILLED,
             OrderState.REJECTED,
             OrderState.CANCELED,
+            OrderState.EXPIRED,
             OrderState.UNKNOWN,
         }
     ),
@@ -679,6 +680,7 @@ class Order:
                 "broker_order_id": self._broker_order_id,
                 "created_at": self._created_at,
                 "updated_at": self._updated_at,
+                "history": [transition.as_details() for transition in self._history],
                 "intent": {
                     "strategy_id": intent.strategy_id,
                     "signal_id": intent.signal_id,
@@ -721,6 +723,8 @@ class Order:
         """
         order_id = payload["order_id"]
         intent_payload = payload["intent"]
+        if not isinstance(intent_payload, Mapping):
+            raise TypeError("persisted intent must be an object")
         limit_price = intent_payload["limit_price"]
         intent = OrderIntent(
             strategy_id=intent_payload["strategy_id"],
@@ -771,6 +775,26 @@ class Order:
             )
 
         target = OrderState(payload["state"])
+        if filled.is_zero:
+            if target in (OrderState.PARTIALLY_FILLED, OrderState.FILLED):
+                raise ValueError(
+                    f"persisted state {target.value} requires a recorded fill"
+                )
+        elif filled == intent.quantity:
+            if target is not OrderState.FILLED:
+                raise ValueError(
+                    f"fully filled persisted order cannot be in {target.value}"
+                )
+        elif target not in (
+            OrderState.PARTIALLY_FILLED,
+            OrderState.CANCELED,
+            OrderState.EXPIRED,
+            OrderState.UNKNOWN,
+        ):
+            raise ValueError(
+                f"partially filled persisted order cannot be in {target.value}"
+            )
+
         if target is not order._state:
             # Everything richer than the state apply_fill derived (PENDING_NEW,
             # ACCEPTED, UNKNOWN, terminal-but-unfilled) is set directly. The
@@ -787,6 +811,51 @@ class Order:
         order._notional_total = Decimal(str(payload["notional_total"]))
         order._created_at = str(payload["created_at"])
         order._updated_at = str(payload["updated_at"])
+
+        history_payload = payload["history"]
+        if not isinstance(history_payload, list):
+            raise TypeError("persisted order history must be a list")
+        history: list[OrderTransition] = []
+        expected = OrderState.DRAFT
+        for item in history_payload:
+            if not isinstance(item, Mapping):
+                raise TypeError("persisted order transition must be an object")
+            from_state = OrderState(item["from"])
+            to_state = OrderState(item["to"])
+            via_reconciliation = item["via_reconciliation"]
+            if not isinstance(via_reconciliation, bool):
+                raise TypeError("transition via_reconciliation must be bool")
+            if from_state is not expected:
+                raise ValueError(
+                    f"persisted transition history breaks at {from_state.value}; "
+                    f"expected {expected.value}"
+                )
+            if to_state not in ORDER_TRANSITIONS[from_state]:
+                raise ValueError(
+                    f"persisted transition {from_state.value} -> {to_state.value} "
+                    "is not allowed"
+                )
+            if from_state is OrderState.UNKNOWN and not via_reconciliation:
+                raise ValueError(
+                    "persisted transition leaves UNKNOWN without reconciliation"
+                )
+            history.append(
+                OrderTransition(
+                    from_state=from_state,
+                    to_state=to_state,
+                    at=str(item["at"]),
+                    reason=str(item["reason"]),
+                    via_reconciliation=via_reconciliation,
+                )
+            )
+            expected = to_state
+        if expected is not target:
+            raise ValueError(
+                f"persisted transition history ends in {expected.value}, "
+                f"not declared state {target.value}"
+            )
+        order._history = history
+
         broker_order_id = payload["broker_order_id"]
         order._broker_order_id = None if broker_order_id is None else str(broker_order_id)
         return order

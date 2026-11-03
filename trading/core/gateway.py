@@ -61,7 +61,8 @@ from __future__ import annotations
 
 import decimal
 import threading
-from typing import Mapping, NoReturn
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Mapping, NoReturn
 
 from .audit import AuditCategory, AuditLog, AuditOutcome
 from .authz import (
@@ -84,7 +85,7 @@ from .orders import Order, OrderIntent, OrderState, OrderStore
 from .portfolio import Portfolio
 from .reconciliation import ReconciliationGate
 from .risk import RiskApproval, RiskEngine
-from ..ports.broker import AckOutcome, BrokerAck, BrokerPort
+from ..ports.broker import AckOutcome, BrokerAck, BrokerOrderStatus, BrokerPort
 
 __all__ = ["ExecutionGate", "ExecutionOutcome", "ExecutionResult", "ExecutionGateway"]
 
@@ -229,6 +230,7 @@ class ExecutionGateway:
         audit: AuditLog,
         clock: Clock,
         token_ttl_seconds: int = 30,
+        transaction_factory: Callable[[], ContextManager[None]] | None = None,
     ) -> None:
         # Fail at wiring time, not at the first order.
         authorize(identity, Action.EXECUTE_ORDER)
@@ -269,6 +271,7 @@ class ExecutionGateway:
         self._audit = audit
         self._clock = clock
         self._token_ttl_seconds = int(token_ttl_seconds)
+        self._transaction_factory = transaction_factory
         # One order at a time through the chain. The gates read shared state
         # (open-order counts, reservations, reconciliation status) and a
         # concurrent submission could otherwise observe a half-updated view.
@@ -277,6 +280,12 @@ class ExecutionGateway:
     @property
     def identity(self) -> Principal:
         return self._identity
+
+    def _transaction(self) -> ContextManager[None]:
+        """Return the injected persistence transaction, or a no-op context."""
+        if self._transaction_factory is None:
+            return nullcontext()
+        return self._transaction_factory()
 
     # -- the chain --------------------------------------------------------
 
@@ -447,12 +456,16 @@ class ExecutionGateway:
         """Persist, send, and interpret the answer."""
         # Persist in PENDING_NEW *before* sending: a crash after this point is
         # recoverable, a crash before it means nothing was sent.
-        self._orders.add(order)
-        order.transition_to(
-            OrderState.PENDING_NEW, reason="submitted through execution gateway"
-        )
-        self._risk.record_submission()
-        self._dedupe.mark_submitted(order.idempotency_key, note="sent to broker")
+        with self._transaction():
+            self._orders.add(order)
+            order.transition_to(
+                OrderState.PENDING_NEW, reason="submitted through execution gateway"
+            )
+            # The write-before-send checkpoint. A new process must see PENDING_NEW
+            # before the venue could possibly have received this order.
+            self._orders.update(order)
+            self._risk.record_submission()
+            self._dedupe.mark_submitted(order.idempotency_key, note="sent to broker")
 
         try:
             ack = self._broker.place_order(order, token=token)
@@ -483,6 +496,15 @@ class ExecutionGateway:
         self, order: Order, ack: BrokerAck, *, mode_is_live: bool
     ) -> ExecutionResult:
         """Apply a definitive ack to the order and the ledger."""
+        with self._transaction():
+            return self._settle_transactional(
+                order, ack, mode_is_live=mode_is_live
+            )
+
+    def _settle_transactional(
+        self, order: Order, ack: BrokerAck, *, mode_is_live: bool
+    ) -> ExecutionResult:
+        """The definitive-ack mutations, inside one persistence transaction."""
         if ack.broker_order_id:
             order.attach_broker_order_id(ack.broker_order_id)
 
@@ -490,6 +512,7 @@ class ExecutionGateway:
             order.transition_to(
                 OrderState.REJECTED, reason=ack.message or "rejected by venue"
             )
+            self._orders.update(order)
             self._dedupe.mark_settled(order.idempotency_key, note="rejected by venue")
             self._audit_result(order, ExecutionOutcome.REFUSED, ack, AuditOutcome.REFUSED)
             return ExecutionResult(
@@ -503,11 +526,16 @@ class ExecutionGateway:
         if ack.outcome is AckOutcome.FILLED:
             assert ack.filled_quantity is not None and ack.fill_price is not None
             order.apply_fill(ack.filled_quantity, ack.fill_price, reason="venue fill")
+            # Persist the cumulative fill before moving the portfolio. If the
+            # process dies between the two writes, reconciliation sees a
+            # mismatch instead of replaying the fill into the position twice.
+            self._orders.update(order)
             self._record_fill(order, ack)
         else:
             order.transition_to(
                 OrderState.ACCEPTED, reason=ack.message or "accepted by venue"
             )
+            self._orders.update(order)
 
         self._dedupe.mark_settled(
             order.idempotency_key, note=f"venue {ack.outcome.value}"
@@ -615,6 +643,24 @@ class ExecutionGateway:
                     f"in state {order.state.value}",
                 )
 
+        if ack.terminal_status is not None:
+            assert ack.filled_quantity is not None
+            if ack.filled_quantity < order.filled_quantity:
+                self._refuse_venue_state(
+                    order,
+                    ack,
+                    f"terminal venue observation regressed filled quantity for "
+                    f"{order.order_id}: venue {ack.filled_quantity}, local "
+                    f"{order.filled_quantity}",
+                )
+            if ack.filled_quantity == order.intent.quantity:
+                self._refuse_venue_state(
+                    order,
+                    ack,
+                    f"venue reports {ack.terminal_status.value} for fully filled "
+                    f"order {order.order_id}",
+                )
+
         # -- application -----------------------------------------------------
         if ack.outcome is AckOutcome.REJECTED:
             # "The venue has no record" normally means the order never existed,
@@ -659,6 +705,9 @@ class ExecutionGateway:
 
             # Record only the delta fill in the portfolio (if any delta was applied)
             if not delta_qty.is_zero:
+                # Same ordering as the immediate-fill path: order first,
+                # position second, so restart cannot double-book the delta.
+                self._orders.update(order)
                 delta_ack = BrokerAck(
                     outcome=AckOutcome.FILLED,
                     broker_order_id=ack.broker_order_id,
@@ -666,7 +715,7 @@ class ExecutionGateway:
                     fill_price=delta_price,
                 )
                 self._record_fill(order, delta_ack)
-        elif ack.outcome is AckOutcome.ACCEPTED:
+        elif ack.outcome is AckOutcome.ACCEPTED and ack.terminal_status is None:
             # The venue confirms the order is working. If we already believe
             # that, there is nothing to record: ACCEPTED -> ACCEPTED is absent
             # from the transition table because re-affirming a state is not a
@@ -682,9 +731,24 @@ class ExecutionGateway:
                     via_reconciliation=via_reconciliation,
                 )
 
+        if ack.terminal_status is not None:
+            target = (
+                OrderState.CANCELED
+                if ack.terminal_status is BrokerOrderStatus.CANCELED
+                else OrderState.EXPIRED
+            )
+            self._transition_or_refuse(
+                order,
+                ack,
+                target,
+                reason=f"venue reports order {ack.terminal_status.value}",
+                via_reconciliation=via_reconciliation,
+            )
+
         # Bind the venue's identifier only now that its answer has been applied.
         if ack.broker_order_id:
             order.attach_broker_order_id(ack.broker_order_id)
+            self._orders.update(order)
 
     def _transition_or_refuse(
         self,
@@ -706,6 +770,7 @@ class ExecutionGateway:
             order.transition_to(
                 target, reason=reason, via_reconciliation=via_reconciliation
             )
+            self._orders.update(order)
         except SafetyViolation as exc:
             self._audit_venue_refusal(order, ack, str(exc))
             raise
@@ -740,16 +805,18 @@ class ExecutionGateway:
         subsequent submission until an operator reconciles (INVARIANTS 5, 12).
         The key stays claimed, so a retry cannot smuggle a second copy through.
         """
-        order.mark_unknown(reason=reason)
-        self._dedupe.mark_unknown(order.idempotency_key, note=reason)
-        self._audit_result(order, ExecutionOutcome.UNKNOWN, ack, AuditOutcome.ERROR)
-        return ExecutionResult(
-            outcome=ExecutionOutcome.UNKNOWN,
-            order=order,
-            ack=ack,
-            gate=ExecutionGate.EXECUTION,
-            reason=reason,
-        )
+        with self._transaction():
+            order.mark_unknown(reason=reason)
+            self._orders.update(order)
+            self._dedupe.mark_unknown(order.idempotency_key, note=reason)
+            self._audit_result(order, ExecutionOutcome.UNKNOWN, ack, AuditOutcome.ERROR)
+            return ExecutionResult(
+                outcome=ExecutionOutcome.UNKNOWN,
+                order=order,
+                ack=ack,
+                gate=ExecutionGate.EXECUTION,
+                reason=reason,
+            )
 
     # -- refusal and bookkeeping -----------------------------------------
 
@@ -904,6 +971,25 @@ class ExecutionGateway:
         # applies the delta against what is already on the books, so a fill we
         # had already recorded produces no second position and no second P&L.
         fetched = self._broker.fetch_order_state(order)
+        with self._transaction():
+            return self._complete_cancel(
+                order,
+                operator=operator,
+                cancel_ack=cancel_ack,
+                fetched=fetched,
+                cancel_succeeded=cancel_succeeded,
+            )
+
+    def _complete_cancel(
+        self,
+        order: Order,
+        *,
+        operator: Principal,
+        cancel_ack: BrokerAck,
+        fetched: BrokerAck,
+        cancel_succeeded: bool,
+    ) -> BrokerAck:
+        """Apply a cancel's fetched truth inside one persistence transaction."""
         self._apply_fetched_state(
             order,
             fetched,
@@ -924,6 +1010,7 @@ class ExecutionGateway:
             order.transition_to(
                 OrderState.CANCELED, reason="canceled at operator request"
             )
+            self._orders.update(order)
 
         self._audit.record(
             AuditCategory.ORDER,
@@ -1027,6 +1114,18 @@ class ExecutionGateway:
         )
 
         ack = self._broker.fetch_order_state(order)
+        with self._transaction():
+            return self._complete_sync(order, operator=operator, ack=ack, previous=state)
+
+    def _complete_sync(
+        self,
+        order: Order,
+        *,
+        operator: Principal,
+        ack: BrokerAck,
+        previous: OrderState,
+    ) -> BrokerAck:
+        """Apply a fetched lifecycle state inside one persistence transaction."""
         # via_reconciliation stays False: that flag exists to let an order leave
         # UNKNOWN, and this path refused every UNKNOWN order above. An UNCERTAIN
         # answer is refused in there rather than marking the order UNKNOWN -- a
@@ -1043,7 +1142,7 @@ class ExecutionGateway:
             details={
                 "order_id": order.order_id,
                 "state": order.state.value,
-                "previous_state": state.value,
+                "previous_state": previous.value,
                 "idempotency_key": order.idempotency_key,
                 "ack": ack.as_details(),
             },
@@ -1184,6 +1283,14 @@ class ExecutionGateway:
                 details={"order_id": order.order_id, "ack": ack.as_details()},
             )
             return ack
+
+        with self._transaction():
+            return self._complete_unknown_resolution(order, operator=operator, ack=ack)
+
+    def _complete_unknown_resolution(
+        self, order: Order, *, operator: Principal, ack: BrokerAck
+    ) -> BrokerAck:
+        """Apply an UNKNOWN resolution inside one persistence transaction."""
 
         # Use _apply_fetched_state for consistent cumulative-to-delta handling.
         # This prevents double-booking when the order had prior fills before

@@ -1,37 +1,26 @@
 """Durable, crash-safe persistence for the pieces written through the ports.
 
 Everything else in :mod:`trading.adapters.persistence` keeps its state in a dict
-that dies with the process. These two adapters write their state to disk, so an
-UNKNOWN reservation (INVARIANT 5), a claimed idempotency key (INVARIANT 12), and
-the local position ledger (INVARIANT 6) survive a real process exit rather than
-only a same-process ``_build_stack`` rebuild.
+that dies with the process. These adapters write their state to disk, so an
+UNKNOWN order/reservation (INVARIANT 5), a claimed idempotency key (INVARIANT
+12), and the local position ledger (INVARIANT 6) survive a real process exit
+rather than only a same-process ``_build_stack`` rebuild.
 
-Why only reservations and positions
-====================================
+What is durable
+===============
 
-Durability here rides on an explicit write call. The idempotency registry calls
-``add``/``update``/``delete`` on its reservation repository for *every* state
-change, and the portfolio calls ``apply_fill``/``set_position`` on its ledger for
-every position change -- so a subclass that persists after each of those calls
-captures the whole truth with no change to the execution path.
+Durability rides on explicit repository writes. The execution gateway calls
+``add`` once and ``update`` after every order mutation, including the critical
+``PENDING_NEW`` write *before* the venue call. The idempotency registry writes
+every reservation transition, and the portfolio writes every position change.
+Together those callbacks capture orders, duplicate-prevention state, and local
+positions without putting filesystem I/O inside the kernel's value objects.
 
-Orders are deliberately absent. The gateway persists an order once, with
-``orders.add(order)`` at ``DRAFT``, and then advances it *in place*
-(``order.transition_to(...)``) without ever calling back into the store. A
-durable order store would therefore capture only the ``DRAFT`` snapshot and miss
-the PENDING_NEW/ACCEPTED/FILLED transitions that recovery needs. Closing that gap
-means either a gateway ``update(order)`` call at the write-before-send checkpoint
-or an on-mutation observer on :class:`~trading.core.orders.Order` -- both change
-the execution chokepoint or the core order object, so both are the operator's
-call, not a persistence-layer decision. Until then, durable orders are **not**
-offered here, and ``docs/CLAUDE_HANDOFF.md`` records what activating them needs.
-
-That split is itself fail-safe. After a real restart with these two adapters
-wired in, a persisted UNKNOWN reservation still blocks every new order
-(``has_unknown`` is read straight off disk), and a claimed key still refuses a
-duplicate -- even though the order object behind it did not survive. The system
-comes up *remembering it has something unresolved* rather than cheerfully
-forgetting, which is the direction a safety kernel must err in.
+The independent reservation backstop remains fail-safe. If an order snapshot is
+unavailable but a reservation file survives, a persisted UNKNOWN reservation
+still blocks every new order and a claimed key still refuses a duplicate. With
+all three adapters wired, the order object also survives and can be reconciled
+through the gateway after restart.
 
 Crash-safety
 ============
@@ -57,13 +46,16 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from ...core.clock import Clock
 from ...core.dedupe import Reservation, ReservationState, ReservationStore
 from ...core.money import Quantity
+from ...core.orders import Order, OrderStore
 from ...core.reconciliation import PositionLedger
-from ...ports.repository import PositionRepositoryPort
+from ...ports.repository import OrderRepositoryPort, PositionRepositoryPort
 from ...ports.reservation_repository import ReservationRepositoryPort
 
 __all__ = [
+    "DurableOrderStore",
     "DurablePositionLedger",
     "DurableReservationRepository",
     "PersistenceError",
@@ -122,6 +114,83 @@ def _load_json(path: Path) -> dict[str, Any] | None:
             f"(expected version {_SCHEMA_VERSION}); refusing to interpret it"
         )
     return payload
+
+
+class DurableOrderStore(OrderStore):
+    """An :class:`OrderStore` whose complete snapshots survive process exit.
+
+    The supplied clock is attached to restored orders so future transitions use
+    the new process's time source. Reads use the in-memory working set; every
+    successful ``add`` or ``update`` atomically replaces the on-disk collection.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, clock: Clock) -> None:
+        if not isinstance(clock, Clock):
+            raise TypeError("clock must implement Clock")
+        super().__init__()
+        self._path = Path(path)
+        self._clock = clock
+        self._load()
+
+    def _load(self) -> None:
+        payload = _load_json(self._path)
+        if payload is None:
+            return
+        entries = payload.get("orders", [])
+        if not isinstance(entries, list):
+            raise PersistenceError(
+                f"durable order store at {self._path} is malformed: "
+                "'orders' is not a list"
+            )
+
+        restored: list[Order] = []
+        try:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise TypeError("an order entry is not an object")
+                restored.append(Order.from_dict(entry, clock=self._clock))
+        except (KeyError, ValueError, ArithmeticError, TypeError) as exc:
+            raise PersistenceError(
+                f"durable order store at {self._path} has an unreadable "
+                f"entry: {exc}"
+            ) from exc
+
+        with self._lock:
+            for order in restored:
+                if order.idempotency_key in self._by_key:
+                    raise PersistenceError(
+                        f"durable order store at {self._path} contains duplicate "
+                        f"idempotency key {order.idempotency_key[:16]}..."
+                    )
+                try:
+                    OrderStore.add(self, order)
+                except Exception as exc:
+                    raise PersistenceError(
+                        f"durable order store at {self._path} contains a duplicate "
+                        f"order: {exc}"
+                    ) from exc
+
+    def _flush(self) -> None:
+        with self._lock:
+            _atomic_write_json(
+                self._path,
+                {
+                    "version": _SCHEMA_VERSION,
+                    "orders": [order.to_dict() for order in self._by_id.values()],
+                },
+            )
+
+    def add(self, order: Order) -> Order:
+        with self._lock:
+            result = super().add(order)
+            self._flush()
+            return result
+
+    def update(self, order: Order) -> Order:
+        with self._lock:
+            result = super().update(order)
+            self._flush()
+            return result
 
 
 class DurableReservationRepository(ReservationStore):
@@ -272,4 +341,5 @@ class DurablePositionLedger(PositionLedger):
 # Conformance, declared from the adapter side exactly as the in-memory adapters
 # do it. The signature check in tests/test_ports.py is the real guarantee.
 ReservationRepositoryPort.register(DurableReservationRepository)
+OrderRepositoryPort.register(DurableOrderStore)
 PositionRepositoryPort.register(DurablePositionLedger)

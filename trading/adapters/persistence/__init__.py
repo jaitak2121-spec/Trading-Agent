@@ -8,9 +8,9 @@ This package provides:
 - OrderStore: In-memory OrderRepository implementation
 - PositionLedger: In-memory PositionRepository implementation
 - ReservationRepository: In-memory ReservationRepository implementation
-- DurableReservationRepository / DurablePositionLedger: crash-safe, on-disk
-  implementations of the reservation and position ports (opt-in; the default
-  wiring stays in-memory). See durable.py for why orders are not among them.
+- DurableOrderStore / DurableReservationRepository / DurablePositionLedger:
+  crash-safe, on-disk implementations of the repository ports (opt-in; the
+  default wiring stays in-memory).
 
 For restart recovery, see trading.adapters.recovery.RestartRecoveryCoordinator.
 """
@@ -18,6 +18,7 @@ For restart recovery, see trading.adapters.recovery.RestartRecoveryCoordinator.
 from __future__ import annotations
 
 from .durable import (
+    DurableOrderStore,
     DurablePositionLedger,
     DurableReservationRepository,
     PersistenceError,
@@ -25,11 +26,22 @@ from .durable import (
 from .order_store import OrderStoreAdapter
 from .position_ledger import PositionLedgerAdapter as PositionLedger
 from .reservation_repository import ReservationRepository
+from .sqlite import (
+    SQLiteAuditSink,
+    SQLiteOrderStore,
+    SQLitePnlLedger,
+    SQLitePortfolio,
+    SQLitePositionLedger,
+    SQLiteReservationRepository,
+    SQLiteRiskEngine,
+    SQLiteState,
+)
 
 # The package-level name is the adapter implementation, not the core class.
 OrderStore = OrderStoreAdapter
 
 __all__ = [
+    "DurableOrderStore",
     "DurablePositionLedger",
     "DurableReservationRepository",
     "OrderStore",
@@ -37,4 +49,12 @@ __all__ = [
     "PersistenceError",
     "PositionLedger",
     "ReservationRepository",
+    "SQLiteAuditSink",
+    "SQLiteOrderStore",
+    "SQLitePnlLedger",
+    "SQLitePortfolio",
+    "SQLitePositionLedger",
+    "SQLiteReservationRepository",
+    "SQLiteRiskEngine",
+    "SQLiteState",
 ]

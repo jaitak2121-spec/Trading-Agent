@@ -501,13 +501,15 @@ class TestStateQueries(SandboxCase):
         self.assertIs(ack.outcome, AckOutcome.FILLED)
         self.assertEqual(ack.filled_quantity, Quantity("0.0004", ASSET))
 
-    def test_a_canceled_order_is_reported_as_no_longer_held(self) -> None:
+    def test_a_canceled_order_preserves_terminal_lifecycle_state(self) -> None:
         order = self.order()
         self.transport.responses["fetch_order_state"] = SandboxResponse(
             200, {"order_id": "SB-1", "status": "canceled"}
         )
         ack = self.broker.fetch_order_state(order)
-        self.assertIs(ack.outcome, AckOutcome.REJECTED)
+        self.assertIs(ack.outcome, AckOutcome.ACCEPTED)
+        self.assertIs(ack.terminal_status, BrokerOrderStatus.CANCELED)
+        self.assertEqual(ack.filled_quantity, Quantity.zero(ASSET))
         self.assertIn("canceled", ack.message)
 
     def test_a_transport_failure_on_a_state_query_raises(self) -> None:
@@ -675,6 +677,47 @@ class TestThroughTheGateway(unittest.TestCase):
         result = self.rig.submit()
         self.assertTrue(result.is_executed, result.reason)
         self.assertIs(result.order.state, OrderState.ACCEPTED)
+
+    def test_partial_fill_then_cancel_books_fill_before_terminal_state(self) -> None:
+        self.transport.responses["place_order"] = SandboxResponse(200, open_body())
+        result = self.rig.submit()
+        order = result.order
+        self.transport.responses["fetch_order_state"] = SandboxResponse(
+            200,
+            filled_body(
+                quantity="0.0004", price="50000", status="canceled"
+            ),
+        )
+
+        ack = self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+
+        self.assertIs(ack.terminal_status, BrokerOrderStatus.CANCELED)
+        self.assertIs(order.state, OrderState.CANCELED)
+        self.assertEqual(order.filled_quantity, Quantity("0.0004", ASSET))
+        self.assertEqual(
+            self.rig.positions.position(SYMBOL, asset=ASSET),
+            Quantity("0.0004", ASSET),
+        )
+
+    def test_partial_fill_then_expiry_books_fill_before_terminal_state(self) -> None:
+        self.transport.responses["place_order"] = SandboxResponse(200, open_body())
+        order = self.rig.submit().order
+        self.transport.responses["fetch_order_state"] = SandboxResponse(
+            200,
+            filled_body(
+                quantity="0.0002", price="50000", status="expired"
+            ),
+        )
+
+        ack = self.rig.gateway.sync_order(order, operator=self.rig.operator_id)
+
+        self.assertIs(ack.terminal_status, BrokerOrderStatus.EXPIRED)
+        self.assertIs(order.state, OrderState.EXPIRED)
+        self.assertEqual(order.filled_quantity, Quantity("0.0002", ASSET))
+        self.assertEqual(
+            self.rig.positions.position(SYMBOL, asset=ASSET),
+            Quantity("0.0002", ASSET),
+        )
 
     def test_an_overfill_never_reaches_risk_as_a_booked_fill(self) -> None:
         self.transport.responses["place_order"] = SandboxResponse(
