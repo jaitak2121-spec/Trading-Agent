@@ -249,7 +249,7 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   `trading/adapters/operations.py`: a redacted `OperationalStatus` with a
   fail-closed `ready` predicate, and `StartupCoordinator` for configuration
   validation, recovery scan and initial sweep. See §7 item 17.
-- **2L — Tests for all critical paths.** **Landed.** 2,096 tests; the last
+- **2L — Tests for all critical paths.** **Landed.** 2,106 tests; the last
   measured whole-project coverage was 95.2% before the CoinSwitch adapter.
 - **Landed:** transactional SQLite persistence plus paper-app startup recovery.
   Execution settlement and daily risk/rate state are transactional; construction
@@ -288,7 +288,10 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   `client_order_id`, and refuses overfills, status/quantity contradictions, and
   account-wide portfolio data masquerading as exchange positions. It contains
   no host, HTTP client, signer, or credentials. Official material publishes only
-  the production Spot host; no sandbox/testnet endpoint was found.
+  the production Spot host; no sandbox/testnet endpoint was found. The official
+  API Surfaces, Quickstart, and Changelog were checked again on November 10,
+  2026 with the same result; written confirmation must come from
+  `api@coinswitch.co` before this boundary moves.
 - **Landed:** cumulative fill plus terminal lifecycle observations.
   `BrokerAck.terminal_status` can carry `CANCELED` or `EXPIRED` together with
   the venue's cumulative quantity. The gateway validates against regression and
@@ -337,6 +340,12 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   checkpoint, reopens the same SQLite state, and proves cash/audit/readiness
   continuity through a second soak. A deliberately open local position remains
   a reconciliation block after rebuilding the in-memory paper venue.
+- **Release-qualified:** the November 10, 2026 wheel passed the complete
+  installed-artifact drill after visual dashboard verification. Long position
+  and order histories are bounded and scrollable, tables have explicit column
+  labels, and the headline health badge includes feed connectivity and metadata
+  expiry. The final wheel SHA-256 is
+  `951d301dcc95c33fc9bf0407ce5e7589b6297d03de301142e484aa4b22d3f094`.
 - **Landed:** exact-confirmation recovery for that interrupted paper-only case.
   It refuses open/UNKNOWN orders, non-paper brokers and missing mismatch; adopts
   the rebuilt venue snapshot via the existing operator reconciliation API,
@@ -353,9 +362,34 @@ Stages 2A–2F are done (§2 above), and 2G–2L are implemented in the working 
   `--coinswitch-observe-seconds` observes without constructing any order path,
   fails unless quotes and a completed one-minute candle arrive and the stream
   ends recovered, and atomically records message/error/reconnect totals with
-  explicit no-credentials and live-off markers. The November 3, 2026 BTC/USDT
-  check completed 150 seconds with 274 quotes, three candles, and no feed errors
-  or reconnects. A multi-hour unattended run remains the next operational step.
+  explicit no-credentials and live-off markers. The November 10–11, 2026
+  four-hour BTC/USDT check passed with 26,260 quotes, 240 candles, seven
+  transient feed-error polls, and four successful reconnects from four attempts.
+  Its evidence SHA-256 is
+  `448bfe9c19d7e15f70dc5761877707fd8288fd0c395e1a648eba075fe293eaba`.
+- **Landed:** execution-isolated experience capture. `--observation-data`
+  atomically writes exact completed public candles under a versioned schema for
+  offline research. The file is marked training-only and is never consumed by
+  the running strategy; model training, validation, approval, and promotion are
+  deliberately not automatic.
+- **Landed:** safe model-data preparation. `--split-model-data` validates at
+  least 240 contiguous candles and atomically writes chronological,
+  non-overlapping training and evaluation halves bound to the source hash.
+- **Landed, not self-promoting:** dependency-free offline direction-model training.
+  `--train-model` uses a chronological 70/30 split, rejects unsafe or gapped
+  candle datasets, and compares holdout accuracy with a majority baseline.
+  Every model is unapproved, paper-only, and non-self-promoting.
+- **Landed, evidence-only:** independent model evaluation. The candidate and
+  evaluation dataset are SHA-256 bound, and reuse of the training dataset is
+  refused. Recorded candle-time bounds also refuse any partial overlap. A
+  baseline-beating result is only eligibility evidence; it remains
+  unapproved, paper-only, and live-off.
+- **Landed, explicitly gated:** ML inference in CoinSwitch paper mode. It loads
+  only an eligible candidate plus distinct eligible evaluation bound to the
+  exact model SHA-256, and requires an exact operator confirmation containing
+  that hash. Signals carry probability and model evidence, use ATR-defined risk,
+  and still terminate at the in-process paper broker. There is no automatic
+  retraining, promotion, live transport, credential path, or risk-limit change.
 - **Not started:** a live or sandbox broker connection. The local read-only
   HTTP/UI adapter is landed and deliberately has no execution controls.
 

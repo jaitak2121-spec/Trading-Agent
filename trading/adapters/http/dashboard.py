@@ -38,6 +38,7 @@ class OperatorDashboard:
         market_specification=None,
         clock=None,
         alert_limit: int = 100,
+        strategy_name: str | None = None,
     ) -> None:
         required = ("monitor", "audit", "portfolio", "orders", "config", "modes", "startup")
         if any(not hasattr(stack, name) for name in required):
@@ -56,6 +57,10 @@ class OperatorDashboard:
             raise TypeError("alert_limit must be an int")
         if alert_limit <= 0:
             raise ValueError("alert_limit must be positive")
+        if strategy_name is not None and (
+            not isinstance(strategy_name, str) or not strategy_name.strip()
+        ):
+            raise ValueError("strategy_name must be a non-empty string or None")
         self._stack = stack
         self._supervisor = supervisor
         self._audit_limit = audit_limit
@@ -68,8 +73,24 @@ class OperatorDashboard:
         self._alert_states: dict[str, object] = {}
         self._alerts: list[dict[str, object]] = []
         self._alert_sequence = 0
+        self._strategy_name = strategy_name
 
     def snapshot(self) -> dict[str, object]:
+        persistence = getattr(self._stack, "persistence", None)
+        revision = getattr(persistence, "snapshot_revision", None)
+        read = getattr(persistence, "read", None)
+        if callable(revision):
+            for _ in range(3):
+                before = revision()
+                snapshot = self._snapshot()
+                if revision() == before:
+                    return snapshot
+        if callable(read):  # continuous writes: take one consistent fallback
+            with read():
+                return self._snapshot()
+        return self._snapshot()
+
+    def _snapshot(self) -> dict[str, object]:
         status = self._stack.monitor.status()
         records = self._stack.audit.records()
         positions = self._stack.portfolio.open_positions()
@@ -89,6 +110,7 @@ class OperatorDashboard:
                 "environment": self._stack.config.environment,
                 "mode": self._stack.modes.mode.value,
                 "live_trading": self._stack.config.is_live_authorized,
+                "strategy": self._strategy_name,
             },
             "supervisor": supervisor_status.as_details(),
             "operations": operations,
@@ -446,5 +468,5 @@ class DashboardServer:
 
 
 _HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Trading App</title><style>
-:root{color-scheme:dark;--bg:#09111f;--panel:#111d30;--line:#263a55;--text:#e8eef8;--muted:#91a4bd;--ok:#55d6a8;--bad:#ff758f}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#07101c,#0e1a2c);color:var(--text);font:14px system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:22px}h1{margin:0;font-size:28px}h2{font-size:15px;margin:0 0 14px}.muted{color:var(--muted)}.badge{padding:7px 11px;border:1px solid var(--line);border-radius:999px}.ok{color:var(--ok)}.bad{color:var(--bad)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.panel{background:#111d30e6;border:1px solid var(--line);border-radius:14px;padding:17px}.wide{grid-column:span 2}.full{grid-column:1/-1}.metric{font-size:24px;font-weight:700;margin-top:6px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid var(--line)}th{color:var(--muted)}pre{white-space:pre-wrap;max-height:310px;overflow:auto}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide,.full{grid-column:auto}}</style></head><body><main><header><div><h1>Trading App</h1><div class="muted">Local paper operations dashboard</div></div><div id="health" class="badge">Connecting…</div></header><section class="grid"><article class="panel"><h2>Mode</h2><div id="mode" class="metric">—</div></article><article class="panel"><h2>Readiness</h2><div id="ready" class="metric">—</div></article><article class="panel"><h2>Cash</h2><div id="cash" class="metric">—</div></article><article class="panel"><h2>Cycles</h2><div id="cycles" class="metric">—</div></article><article class="panel full"><h2>Market metadata</h2><div id="metadata" class="muted">Not applicable</div></article><article class="panel wide"><h2>Positions</h2><table><tbody id="positions"></tbody></table></article><article class="panel wide"><h2>Orders</h2><table><tbody id="orders"></tbody></table></article><article class="panel full"><h2>Alerts</h2><pre id="alerts">No transitions yet.</pre></article><article class="panel full"><h2>Last cycle</h2><pre id="cycle">No cycle yet.</pre></article><article class="panel full"><h2>Blocked reasons</h2><div id="blocked" class="muted">—</div></article></section></main><script>
-const q=id=>document.getElementById(id),cell=(r,v)=>{const d=document.createElement('td');d.textContent=v??'—';r.appendChild(d)};function rows(id,x,fs){const b=q(id);b.replaceChildren();for(const i of x){const r=document.createElement('tr');for(const f of fs)cell(r,f(i));b.appendChild(r)}if(!x.length){const r=document.createElement('tr');cell(r,'None');b.appendChild(r)}}async function refresh(){try{const r=await fetch('/api/snapshot',{cache:'no-store'}),d=await r.json(),h=d.supervisor.healthy&&d.operations.ready;q('health').textContent=h?'Healthy':'Attention required';q('health').className='badge '+(h?'ok':'bad');q('mode').textContent=d.application.mode.toUpperCase();q('ready').textContent=d.operations.ready?'READY':'BLOCKED';q('ready').className='metric '+(d.operations.ready?'ok':'bad');q('cash').textContent=d.portfolio.cash+' '+d.portfolio.currency;q('cycles').textContent=d.supervisor.passes;const m=d.market_metadata;q('metadata').textContent=m?(m.state.toUpperCase()+' · '+(m.source||'no source')+' · '+(m.seconds_remaining===null?'no expiry':Math.round(m.seconds_remaining/60)+' min remaining')):'Not applicable';q('metadata').className=m&&(m.warning||m.blocked)?'bad':'muted';q('alerts').textContent=d.alerts.length?JSON.stringify(d.alerts.slice(-10),null,2):'No transitions yet.';rows('positions',d.portfolio.positions,[x=>x.symbol,x=>x.quantity+' '+x.asset,x=>x.average_entry_price]);rows('orders',d.orders,[x=>x.state,x=>x.symbol,x=>x.side,x=>x.filled_quantity+' / '+x.ordered_quantity]);q('cycle').textContent=d.supervisor.last_cycle?JSON.stringify(d.supervisor.last_cycle,null,2):'No cycle yet.';q('blocked').textContent=d.operations.blocked_reasons.join(', ')||'None'}catch(e){q('health').textContent='Disconnected';q('health').className='badge bad'}}refresh();setInterval(refresh,2000);</script></body></html>"""
+:root{color-scheme:dark;--bg:#09111f;--panel:#111d30;--line:#263a55;--text:#e8eef8;--muted:#91a4bd;--ok:#55d6a8;--bad:#ff758f}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#07101c,#0e1a2c);color:var(--text);font:14px system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:22px}h1{margin:0;font-size:28px}h2{font-size:15px;margin:0 0 14px}.muted{color:var(--muted)}.badge{padding:7px 11px;border:1px solid var(--line);border-radius:999px}.ok{color:var(--ok)}.bad{color:var(--bad)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.panel{background:#111d30e6;border:1px solid var(--line);border-radius:14px;padding:17px}.wide{grid-column:span 2;align-self:start}.full{grid-column:1/-1}.metric{font-size:24px;font-weight:700;margin-top:6px}.table-scroll{max-height:360px;overflow:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid var(--line)}th{color:var(--muted);position:sticky;top:0;background:var(--panel)}pre{white-space:pre-wrap;max-height:310px;overflow:auto}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide,.full{grid-column:auto}}</style></head><body><main><header><div><h1>Trading App</h1><div class="muted">Local paper operations dashboard</div></div><div id="health" class="badge">Connecting…</div></header><section class="grid"><article class="panel"><h2>Mode</h2><div id="mode" class="metric">—</div></article><article class="panel"><h2>Readiness</h2><div id="ready" class="metric">—</div></article><article class="panel"><h2>Cash</h2><div id="cash" class="metric">—</div></article><article class="panel"><h2>Cycles</h2><div id="cycles" class="metric">—</div></article><article class="panel full"><h2>Market metadata</h2><div id="metadata" class="muted">Not applicable</div></article><article class="panel wide"><h2>Positions</h2><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Quantity</th><th>Average entry</th></tr></thead><tbody id="positions"></tbody></table></div></article><article class="panel wide"><h2>Orders</h2><div class="table-scroll"><table><thead><tr><th>Status</th><th>Symbol</th><th>Side</th><th>Filled / ordered</th></tr></thead><tbody id="orders"></tbody></table></div></article><article class="panel full"><h2>Alerts</h2><pre id="alerts">No transitions yet.</pre></article><article class="panel full"><h2>Last cycle</h2><pre id="cycle">No cycle yet.</pre></article><article class="panel full"><h2>Blocked reasons</h2><div id="blocked" class="muted">—</div></article></section></main><script>
+const q=id=>document.getElementById(id),cell=(r,v)=>{const d=document.createElement('td');d.textContent=v??'—';r.appendChild(d)};function rows(id,x,fs){const b=q(id);b.replaceChildren();for(const i of x){const r=document.createElement('tr');for(const f of fs)cell(r,f(i));b.appendChild(r)}if(!x.length){const r=document.createElement('tr');cell(r,'None');b.appendChild(r)}}async function refresh(){try{const r=await fetch('/api/snapshot',{cache:'no-store'}),d=await r.json(),m=d.market_metadata,h=d.supervisor.healthy&&d.operations.ready&&(!d.market_data||(d.market_data.running&&!d.market_data.last_error))&&(!m||!m.blocked);q('health').textContent=h?'Healthy':'Attention required';q('health').className='badge '+(h?'ok':'bad');q('mode').textContent=d.application.mode.toUpperCase()+' · '+(d.application.strategy||'unknown strategy');q('ready').textContent=d.operations.ready?'READY':'BLOCKED';q('ready').className='metric '+(d.operations.ready?'ok':'bad');q('cash').textContent=d.portfolio.cash+' '+d.portfolio.currency;q('cycles').textContent=d.supervisor.passes;q('metadata').textContent=m?(m.state.toUpperCase()+' · '+(m.source||'no source')+' · '+(m.seconds_remaining===null?'no expiry':Math.round(m.seconds_remaining/60)+' min remaining')):'Not applicable';q('metadata').className=m&&(m.warning||m.blocked)?'bad':'muted';q('alerts').textContent=d.alerts.length?JSON.stringify(d.alerts.slice(-10),null,2):'No transitions yet.';rows('positions',d.portfolio.positions,[x=>x.symbol,x=>x.quantity+' '+x.asset,x=>x.average_entry_price]);rows('orders',d.orders,[x=>x.state,x=>x.symbol,x=>x.side,x=>x.filled_quantity+' / '+x.ordered_quantity]);q('cycle').textContent=d.supervisor.last_cycle?JSON.stringify(d.supervisor.last_cycle,null,2):'No cycle yet.';q('blocked').textContent=d.operations.blocked_reasons.join(', ')||'None'}catch(e){q('health').textContent='Disconnected';q('health').className='badge bad'}}refresh();setInterval(refresh,2000);</script></body></html>"""

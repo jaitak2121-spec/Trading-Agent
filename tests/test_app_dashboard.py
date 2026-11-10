@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import http.client
 import json
+import tempfile
+import threading
 import unittest
 
 from trading.app import (
@@ -31,11 +33,29 @@ class IdleService:
 def build_dashboard():
     stack = build_paper_stack()
     supervisor = PaperServiceSupervisor(IdleService(), interval_seconds=10)
-    dashboard = OperatorDashboard(stack, supervisor)
+    dashboard = OperatorDashboard(stack, supervisor, strategy_name="test-strategy")
     return dashboard, supervisor
 
 
 class OperatorDashboardTest(unittest.TestCase):
+    def test_persisted_snapshot_waits_for_the_active_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = build_paper_stack(sqlite_path=f"{directory}/state.sqlite3")
+            supervisor = PaperServiceSupervisor(IdleService())
+            dashboard = OperatorDashboard(stack, supervisor)
+            finished = threading.Event()
+
+            with stack.persistence.transaction():
+                worker = threading.Thread(
+                    target=lambda: (dashboard.snapshot(), finished.set()),
+                    daemon=True,
+                )
+                worker.start()
+                self.assertFalse(finished.wait(0.05))
+            self.assertTrue(finished.wait(1))
+            worker.join(1)
+            stack.persistence.close()
+
     def test_snapshot_is_json_safe_redacted_operational_state(self) -> None:
         dashboard, _ = build_dashboard()
 
@@ -43,6 +63,7 @@ class OperatorDashboardTest(unittest.TestCase):
 
         self.assertEqual(snapshot["application"]["mode"], "paper")
         self.assertFalse(snapshot["application"]["live_trading"])
+        self.assertEqual(snapshot["application"]["strategy"], "test-strategy")
         self.assertEqual(snapshot["portfolio"]["currency"], "USD")
         self.assertIn("operations", snapshot)
         self.assertIn("orders", snapshot)
@@ -228,6 +249,8 @@ class DashboardHTTPTest(unittest.TestCase):
         body = response.read().decode("utf-8")
         self.assertEqual(response.status, 200)
         self.assertIn("Trading App", body)
+        self.assertIn("<th>Filled / ordered</th>", body)
+        self.assertIn("d.market_data.running&&!d.market_data.last_error", body)
         self.assertEqual(response.getheader("Cache-Control"), "no-store")
 
         self.connection.request("GET", "/api/snapshot")

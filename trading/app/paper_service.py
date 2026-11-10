@@ -122,6 +122,10 @@ class RealtimePaperService:
     def last_cycle(self) -> PaperServiceCycle | None:
         return self._last
 
+    @property
+    def strategy_name(self) -> str:
+        return self._runner.strategy_name
+
     def poll_once(self) -> PaperServiceCycle:
         prior_candle_counts = {
             symbol: len(self._store.candles(symbol))

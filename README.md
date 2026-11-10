@@ -1198,10 +1198,9 @@ oversight.
 
 ## Development Status
 
-**Current focus:** CoinSwitch paper-order compatibility and sandbox execution
-research.
+**Current focus:** CoinSwitch sandbox access and real-data paper-model validation.
 
-**Current reported test status:** `2,096 tests passing` (`4` loopback socket
+**Current reported test status:** `2,106 tests passing` (`4` loopback socket
 tests are skipped when the environment forbids local binds).
 
 **Current integrated milestone:** `RealtimePaperService.poll_once()` now performs
@@ -1256,6 +1255,14 @@ starts and health-checks the dashboard, waits for a flat checkpoint, sends
 recovery soak. Stopping during an open paper position is deliberately not called
 a clean restart: the rebuilt in-memory paper venue cannot claim the old venue
 position, so reconciliation correctly blocks it.
+
+The November 10, 2026 final installed-artifact drill passed after the dashboard
+usability review. The dependency-free wheel is
+`dist/safety_first_trading_app-0.1.0-py3-none-any.whl`; its SHA-256 is
+`951d301dcc95c33fc9bf0407ce5e7589b6297d03de301142e484aa4b22d3f094`.
+The dashboard now labels every table column, bounds long histories in scrollable
+panels, and includes public-feed connectivity and metadata expiry in its health
+badge.
 
 For that paper-only interruption case, the operator may explicitly adopt the
 rebuilt in-memory paper venue (normally an empty position snapshot):
@@ -1344,13 +1351,75 @@ duration, and finishes with the feed recovered:
 ```bash
 trading-paper --coinswitch-symbol BTC/USDT --coinswitch-exchange c2c1 \
   --coinswitch-observe-seconds 14400 --poll-interval 1 \
-  --observation-report ./artifacts/public-market-observation.json
+  --observation-report ./artifacts/public-market-observation.json \
+  --observation-data ./artifacts/public-candles.json
 ```
 
-The November 3, 2026 bounded live qualification ran for 150.003 seconds and
-received 274 quotes plus three closed candles with zero feed-error polls or
-reconnects. Its `coinswitch-public-observation/v1` evidence explicitly records
-public-data-only operation, no credentials, and live trading off.
+The November 10–11, 2026 four-hour live qualification passed with 26,260 quotes,
+240 closed candles, seven transient feed-error polls, and four successful
+reconnections from four attempts. Its `coinswitch-public-observation/v1`
+evidence explicitly records public-data-only operation, no credentials, and
+live trading off; the evidence SHA-256 is
+`448bfe9c19d7e15f70dc5761877707fd8288fd0c395e1a648eba075fe293eaba`.
+The optional `--observation-data` file uses the
+`coinswitch-public-candles/v1` schema and preserves exact completed public
+candles for offline research. It is marked `training_only`, contains no
+credentials, and is never read directly by the running strategy. Training,
+independent evaluation, and an exact model-bound paper approval remain separate
+steps, so the app cannot retrain or promote itself.
+
+Split a capture of at least 240 contiguous candles into two non-overlapping
+datasets:
+
+```bash
+trading-paper --split-model-data ./artifacts/public-candles.json \
+  --training-data-output ./artifacts/training-candles.json \
+  --evaluation-data-output ./artifacts/evaluation-candles.json
+```
+
+Train an offline candidate from the first half:
+
+```bash
+trading-paper --train-model ./artifacts/training-candles.json \
+  --model-output ./artifacts/candidate-direction-model.json
+```
+
+The dependency-free trainer fits a small logistic direction model on the oldest
+70% of samples and evaluates it on the newest 30%. It rejects shuffled, gapped,
+single-direction, unsafe, or undersized datasets and compares validation accuracy
+with the majority-class baseline. Every output remains `approved=false`,
+`paper_only=true`, and `self_promoting=false`; the execution service does not
+load it automatically.
+
+Evaluate the frozen candidate on a different contiguous dataset:
+
+```bash
+trading-paper --evaluate-model ./artifacts/candidate-direction-model.json \
+  --evaluation-data ./artifacts/evaluation-candles.json \
+  --evaluation-output ./artifacts/model-evaluation.json
+```
+
+The evaluator hashes both inputs and refuses either the training dataset or any
+candle range that overlaps it from being presented as independent evidence. Its
+market must also match the model's recorded symbol and exchange. Its result
+remains unapproved and paper-only, even when it beats the holdout baseline.
+
+After both stages beat their baselines, the exact frozen model can run in the
+CoinSwitch paper application. Replace `<model_sha256>` with the value recorded in
+`model-evaluation.json`:
+
+```bash
+trading-paper --coinswitch-symbol BTC/USDT --coinswitch-exchange c2c1 \
+  --paper-model ./artifacts/candidate-direction-model.json \
+  --paper-model-evaluation ./artifacts/model-evaluation.json \
+  --confirm-paper-model "APPROVE PAPER MODEL <model_sha256>"
+```
+
+Startup refuses missing, failed, mismatched, or modified evidence. The strategy
+is long-only, attaches ATR-based stops and targets, records the model hash and
+probability on every signal, displays the active model hash prefix on the
+dashboard, and still routes solely to the in-process paper
+broker. It cannot promote itself, change risk limits, or reach live execution.
 
 Run a fast, repeatable end-to-end safety soak before changing a transport or
 configuration:
@@ -1373,6 +1442,13 @@ terminal cancelled/expired state. The gateway books only the fill delta first,
 then makes the terminal transition atomically, so neither exposure nor venue
 truth is lost.
 
+This boundary was re-verified against CoinSwitch's official API Surfaces,
+Quickstart, and Changelog on November 10, 2026. They still list production URLs
+and real-account keys only; sandbox availability therefore requires written
+confirmation from `api@coinswitch.co` before authenticated transport work starts.
+A credential-free request template is available at
+[`docs/COINSWITCH_SANDBOX_REQUEST.md`](docs/COINSWITCH_SANDBOX_REQUEST.md).
+
 The dashboard also retains a bounded, in-memory, transition-only alert feed for
 readiness blocking/restoration, market-data loss/recovery, metadata
 warning/expiry/refresh, and supervisor failure/recovery. Repeated polling does
@@ -1393,7 +1469,7 @@ Timed qualification rounds to complete synthetic strategy paths and refuses to
 pass with any open position. Evidence is written atomically only after the
 database closes and includes its final filename, byte size, and hash.
 
-**Next major milestone:** Run the new evidence command unattended for multiple
-hours, then obtain written CoinSwitch confirmation of a non-production test
-environment before adding authenticated transport. The local paper product is
-feature-complete; production execution remains deliberately absent.
+**Next major milestone:** Collect a separate 240+ candle training capture and
+obtain written CoinSwitch confirmation of a non-production test environment.
+The local paper product and four-hour public-data qualification are complete;
+production execution remains deliberately absent.

@@ -62,6 +62,7 @@ def start_health_stop(
                         and not last_snapshot["portfolio"]["positions"]
                     ):
                         break
+                    time.sleep(0.05)
             except Exception:
                 time.sleep(0.1)
         else:
@@ -118,6 +119,7 @@ def start_snapshot_condition_stop(
                     last_snapshot = json.loads(response.read())
                     if condition(last_snapshot):
                         break
+                    time.sleep(0.05)
             except Exception:
                 time.sleep(0.05)
         else:
@@ -219,25 +221,21 @@ def main() -> int:
         python, console = install_isolated(wheel, environment)
         run([str(console), "--help"], stdout=subprocess.DEVNULL)
 
-        state = root / "installed-state.sqlite3"
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
-        for _ in range(2):
-            port = free_loopback_port()
-            start_health_stop(
-                [
-                    str(console),
-                    "--dashboard",
-                    "--port",
-                    str(port),
-                    "--poll-interval",
-                    "0.01",
-                    "--state-db",
-                    str(state),
-                ],
-                port=port,
-                env=env,
-            )
+        port = free_loopback_port()
+        start_health_stop(
+            [
+                str(console),
+                "--dashboard",
+                "--port",
+                str(port),
+                "--poll-interval",
+                "0.01",
+            ],
+            port=port,
+            env=env,
+        )
 
         interrupted = root / "interrupted.sqlite3"
         dashboard_command = [

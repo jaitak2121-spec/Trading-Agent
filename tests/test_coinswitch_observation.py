@@ -11,7 +11,10 @@ import unittest
 from pathlib import Path
 
 from trading.adapters.marketdata import FeedDisconnected
-from trading.adapters.observation_evidence import write_observation_evidence
+from trading.adapters.observation_evidence import (
+    write_observation_dataset,
+    write_observation_evidence,
+)
 from trading.app.coinswitch_observation import run_coinswitch_observation
 from trading.core.clock import UTC
 
@@ -62,12 +65,14 @@ class CoinSwitchObservationTest(unittest.TestCase):
         def wait(seconds: float) -> None:
             clock[0] += seconds
 
+        recorded = []
         report = run_coinswitch_observation(
             stream,
             duration_seconds=3,
             poll_interval_seconds=1,
             wait=wait,
             monotonic=lambda: clock[0],
+            candle_sink=recorded.append,
         )
 
         self.assertTrue(report.passed, report.failures)
@@ -77,6 +82,7 @@ class CoinSwitchObservationTest(unittest.TestCase):
         self.assertEqual(report.candle_messages, 1)
         self.assertEqual(report.feed_error_polls, 1)
         self.assertEqual(report.successful_reconnects, 1)
+        self.assertEqual(recorded, [{"close": "1"}])
 
     def test_fails_without_a_closed_candle_or_when_feed_ends_unavailable(self) -> None:
         stream = _Stream(
@@ -127,12 +133,32 @@ class CoinSwitchObservationTest(unittest.TestCase):
         self.assertEqual(report.poll_attempts, 0)
         self.assertIn("public stream startup failed", report.failures[0])
 
+    def test_writes_public_training_dataset_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "candles.json"
+            started = dt.datetime(2026, 11, 10, tzinfo=UTC)
+            write_observation_dataset(
+                destination,
+                symbol="BTC/USDT",
+                exchange="c2c1",
+                candles=[{"open_time": 1, "close": "100"}],
+                started_at=started,
+                finished_at=started + dt.timedelta(minutes=1),
+            )
+            dataset = json.loads(destination.read_text(encoding="utf-8"))
+
+            self.assertEqual(dataset["schema"], "coinswitch-public-candles/v1")
+            self.assertTrue(dataset["training_only"])
+            self.assertFalse(dataset["credentials_used"])
+            self.assertEqual(dataset["candles"][0]["close"], "100")
+
     def test_cli_requires_a_symbol_and_report_mode(self) -> None:
         from trading.app.__main__ import main
 
         for argv, message in (
             (["--coinswitch-observe-seconds", "60"], "requires --coinswitch-symbol"),
             (["--observation-report", "out.json"], "requires --coinswitch-observe-seconds"),
+            (["--observation-data", "out.json"], "requires --coinswitch-observe-seconds"),
         ):
             error = io.StringIO()
             with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):

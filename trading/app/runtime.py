@@ -19,7 +19,7 @@ from ..adapters.coinswitch import CoinSwitchSpotStream
 from ..core.clock import ManualClock, SystemClock, UTC
 from ..core.config import RiskConfig
 from ..core.money import Currency, INR, Money, USD, USDT
-from ..strategy import MovingAverageCrossover
+from ..strategy import MovingAverageCrossover, SignalStrategy
 from .composition import PaperStack, build_paper_stack
 from .demo_stream import DemoMarketStream
 from .paper_service import RealtimePaperService
@@ -160,7 +160,9 @@ def build_demo_paper_application(
     supervisor = PaperServiceSupervisor(
         service, interval_seconds=poll_interval_seconds
     )
-    dashboard = OperatorDashboard(stack, supervisor)
+    dashboard = OperatorDashboard(
+        stack, supervisor, strategy_name=service.strategy_name
+    )
     server = DashboardServer(dashboard, host=host, port=port)
     return PaperApplication(stack, stream, service, supervisor, dashboard, server)
 
@@ -184,6 +186,7 @@ def build_coinswitch_paper_application(
     market_info_body: bytes | None = None,
     market_info_max_age_hours: int = 24,
     risk: RiskConfig | None = None,
+    strategy: SignalStrategy | None = None,
 ) -> PaperApplication:
     """Build a real CoinSwitch-data application with paper-only execution."""
     normalized_symbol = (
@@ -297,12 +300,14 @@ def build_coinswitch_paper_application(
         store=candles,
         clock=clock,
     )
-    strategy = MovingAverageCrossover(
+    if strategy is not None and not isinstance(strategy, SignalStrategy):
+        raise TypeError("strategy must be a SignalStrategy or None")
+    selected_strategy = strategy or MovingAverageCrossover(
         fast=3, slow=5, atr_period=3, symbols=[market_stream.symbol]
     )
     service = RealtimePaperService(
         stack,
-        strategy,
+        selected_strategy,
         quote_ingestor=quotes,
         candle_ingestor=bars,
         candles=candles,
@@ -318,6 +323,7 @@ def build_coinswitch_paper_application(
         market_data=market_stream,
         market_specification=market,
         clock=clock,
+        strategy_name=service.strategy_name,
     )
     server = DashboardServer(dashboard, host=host, port=port)
     return PaperApplication(

@@ -1,0 +1,24 @@
+{
+  "credentials_used": false,
+  "elapsed_seconds": 14448.881714,
+  "finished_at": "2026-11-10T20:05:32.387123+00:00",
+  "live_trading": false,
+  "public_data_only": true,
+  "report": {
+    "candle_messages": 240,
+    "duration_elapsed_seconds": 14400.004585249997,
+    "duration_requested_seconds": 14400.0,
+    "exchange": "c2c1",
+    "failures": [],
+    "feed_error_polls": 7,
+    "last_feed_error": "FeedDisconnected: CoinSwitch closed the WebSocket",
+    "passed": true,
+    "poll_attempts": 14329,
+    "quote_messages": 26260,
+    "reconnect_attempts": 4,
+    "successful_reconnects": 4,
+    "symbol": "BTC/USDT"
+  },
+  "schema": "coinswitch-public-observation/v1",
+  "started_at": "2026-11-10T16:04:43.505409+00:00"
+}

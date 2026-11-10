@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -100,12 +101,15 @@ def run_coinswitch_observation(
     poll_interval_seconds: float = 1.0,
     wait: Callable[[float], object] | None = None,
     monotonic: Callable[[], float] | None = None,
+    candle_sink: Callable[[Mapping[str, object]], object] | None = None,
 ) -> CoinSwitchObservationReport:
     """Observe both public channels for a fixed duration and stop the stream."""
     if not callable(getattr(stream, "start", None)) or not callable(
         getattr(stream, "stop", None)
     ):
         raise TypeError("stream must provide start() and stop()")
+    if candle_sink is not None and not callable(candle_sink):
+        raise TypeError("candle_sink must be callable or None")
     for name, value in (
         ("duration_seconds", duration_seconds),
         ("poll_interval_seconds", poll_interval_seconds),
@@ -156,11 +160,15 @@ def run_coinswitch_observation(
                 (stream.candle_source, "candle"),
             ):
                 try:
-                    count = len(source.poll())
+                    messages = source.poll()
+                    count = len(messages)
                     if kind == "quote":
                         quotes += count
                     else:
                         candles += count
+                        if candle_sink is not None:
+                            for message in messages:
+                                candle_sink(message)
                 except FeedError as exc:
                     poll_failed = True
                     last_error = redactor.redact(

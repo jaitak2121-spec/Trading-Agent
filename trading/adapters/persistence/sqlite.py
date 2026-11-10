@@ -178,6 +178,11 @@ class SQLiteState:
     def connection(self) -> sqlite3.Connection:
         return self._connection
 
+    def snapshot_revision(self) -> int:
+        """Return a change counter only after any active transaction finishes."""
+        with self._lock:
+            return self._connection.total_changes
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()

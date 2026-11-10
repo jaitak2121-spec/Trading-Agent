@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -37,9 +38,19 @@ from .restart_drill import run_restart_drill
 from .paper_recovery import recover_interrupted_paper_position
 from ..adapters.process import GracefulShutdown
 from ..adapters.coinswitch import CoinSwitchSpotStream
-from ..adapters.observation_evidence import write_observation_evidence
+from ..adapters.observation_evidence import (
+    write_json_atomically,
+    write_observation_dataset,
+    write_observation_evidence,
+)
 from ..adapters.soak_evidence import write_soak_evidence
 from .coinswitch_observation import run_coinswitch_observation
+from .model_training import (
+    evaluate_direction_model,
+    split_direction_datasets,
+    train_direction_model,
+)
+from .model_strategy import PaperDirectionModelStrategy
 
 _SYMBOL = "DEMO"
 _ASSET = "DEMO"
@@ -189,6 +200,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             "execution (supported quote currencies: INR, USDT)"
         ),
     )
+    mode.add_argument(
+        "--train-model",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="train an unapproved paper-only direction model offline",
+    )
+    mode.add_argument(
+        "--evaluate-model",
+        metavar="MODEL",
+        default=None,
+        help="evaluate a frozen model on a distinct candle dataset",
+    )
+    mode.add_argument(
+        "--split-model-data",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="split at least 240 candles into non-overlapping model datasets",
+    )
     parser.add_argument(
         "--host",
         default="127.0.0.1",
@@ -290,6 +319,62 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="atomically write evidence for --coinswitch-observe-seconds",
     )
     parser.add_argument(
+        "--observation-data",
+        metavar="PATH",
+        default=None,
+        help=(
+            "atomically save completed public candles for offline research; "
+            "requires --coinswitch-observe-seconds"
+        ),
+    )
+    parser.add_argument(
+        "--model-output",
+        metavar="PATH",
+        default=None,
+        help="atomic JSON output required by --train-model",
+    )
+    parser.add_argument(
+        "--evaluation-data",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="distinct out-of-sample candles required by --evaluate-model",
+    )
+    parser.add_argument(
+        "--evaluation-output",
+        metavar="PATH",
+        default=None,
+        help="atomic evidence output required by --evaluate-model",
+    )
+    parser.add_argument(
+        "--training-data-output",
+        metavar="PATH",
+        default=None,
+        help="training half required by --split-model-data",
+    )
+    parser.add_argument(
+        "--evaluation-data-output",
+        metavar="PATH",
+        default=None,
+        help="evaluation half required by --split-model-data",
+    )
+    parser.add_argument(
+        "--paper-model",
+        metavar="MODEL",
+        default=None,
+        help="use an explicitly approved model in CoinSwitch paper mode",
+    )
+    parser.add_argument(
+        "--paper-model-evaluation",
+        metavar="EVIDENCE",
+        default=None,
+        help="out-of-sample evidence required by --paper-model",
+    )
+    parser.add_argument(
+        "--confirm-paper-model",
+        default=None,
+        help="exact model-hash confirmation required by --paper-model",
+    )
+    parser.add_argument(
         "--confirm-paper-position-reset",
         default=None,
         help="exact confirmation phrase required for paper position recovery",
@@ -309,6 +394,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--coinswitch-observe-seconds requires --coinswitch-symbol")
     if args.observation_report is not None and args.coinswitch_observe_seconds is None:
         parser.error("--observation-report requires --coinswitch-observe-seconds")
+    if args.observation_data is not None and args.coinswitch_observe_seconds is None:
+        parser.error("--observation-data requires --coinswitch-observe-seconds")
+    if args.train_model is not None and args.model_output is None:
+        parser.error("--train-model requires --model-output")
+    if args.model_output is not None and args.train_model is None:
+        parser.error("--model-output requires --train-model")
+    if args.evaluate_model is not None and (
+        args.evaluation_data is None or args.evaluation_output is None
+    ):
+        parser.error(
+            "--evaluate-model requires --evaluation-data and --evaluation-output"
+        )
+    if args.evaluate_model is None and (
+        args.evaluation_data is not None or args.evaluation_output is not None
+    ):
+        parser.error("evaluation options require --evaluate-model")
+    split_outputs = (args.training_data_output, args.evaluation_data_output)
+    if args.split_model_data is not None and not all(split_outputs):
+        parser.error(
+            "--split-model-data requires --training-data-output and "
+            "--evaluation-data-output"
+        )
+    if args.split_model_data is None and any(split_outputs):
+        parser.error("model-data output options require --split-model-data")
+    paper_model_options = (
+        args.paper_model,
+        args.paper_model_evaluation,
+        args.confirm_paper_model,
+    )
+    if any(value is not None for value in paper_model_options) and not all(
+        value is not None for value in paper_model_options
+    ):
+        parser.error(
+            "--paper-model, --paper-model-evaluation, and --confirm-paper-model "
+            "must be supplied together"
+        )
+    if args.paper_model is not None and args.coinswitch_symbol is None:
+        parser.error("--paper-model requires --coinswitch-symbol")
+    if args.paper_model is not None and args.coinswitch_observe_seconds is not None:
+        parser.error("--paper-model cannot be used in observation-only mode")
 
     profile: TradingConfig | None = None
     if args.config is not None:
@@ -324,10 +449,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         except ConfigurationError as exc:
             parser.error(f"invalid paper configuration profile: {exc}")
-        if args.coinswitch_symbol is None and profile.risk.base_currency != USD:
+        if (
+            args.coinswitch_symbol is None
+            and args.train_model is None
+            and args.evaluate_model is None
+            and args.split_model_data is None
+            and profile.risk.base_currency != USD
+        ):
             parser.error(
                 "synthetic paper modes require a USD configuration profile"
             )
+
+    if args.train_model is not None:
+        try:
+            dataset = json.loads(Path(args.train_model).read_text(encoding="utf-8"))
+            report = train_direction_model(dataset)
+            write_json_atomically(args.model_output, report.model)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(f"model training failed: {exc}")
+        print(report.render())
+        return 0
+
+    if args.split_model_data is not None:
+        try:
+            dataset = json.loads(
+                Path(args.split_model_data).read_text(encoding="utf-8")
+            )
+            training, evaluation = split_direction_datasets(dataset)
+            write_json_atomically(args.training_data_output, training)
+            write_json_atomically(args.evaluation_data_output, evaluation)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(f"model-data split failed: {exc}")
+        print(
+            "model data split: COMPLETE\n"
+            f"training candles  : {len(training['candles'])}\n"
+            f"evaluation candles: {len(evaluation['candles'])}"
+        )
+        return 0
+
+    if args.evaluate_model is not None:
+        try:
+            model = json.loads(Path(args.evaluate_model).read_text(encoding="utf-8"))
+            dataset = json.loads(Path(args.evaluation_data).read_text(encoding="utf-8"))
+            report = evaluate_direction_model(model, dataset)
+            write_json_atomically(args.evaluation_output, report.evidence)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(f"model evaluation failed: {exc}")
+        print(report.render())
+        return 0
 
     if args.coinswitch_symbol is not None:
         try:
@@ -347,6 +516,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"must be valid for that currency ({exc})"
             )
         if args.coinswitch_observe_seconds is not None:
+            observed_candles: list[dict[str, object]] = []
             stream = CoinSwitchSpotStream(
                 symbol=args.coinswitch_symbol,
                 exchange=selected_exchange,
@@ -356,6 +526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stream,
                 duration_seconds=args.coinswitch_observe_seconds,
                 poll_interval_seconds=args.poll_interval,
+                candle_sink=lambda candle: observed_candles.append(dict(candle)),
             )
             observation_finished = _dt.datetime.now(tz=_dt.timezone.utc)
             if args.observation_report is not None:
@@ -365,9 +536,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                     started_at=observation_started,
                     finished_at=observation_finished,
                 )
+            if args.observation_data is not None:
+                write_observation_dataset(
+                    args.observation_data,
+                    symbol=stream.symbol,
+                    exchange=stream.exchange,
+                    candles=observed_candles,
+                    started_at=observation_started,
+                    finished_at=observation_finished,
+                )
             print(report.render())
             return 0 if report.passed else 2
         try:
+            paper_strategy = None
+            if args.paper_model is not None:
+                model = json.loads(Path(args.paper_model).read_text(encoding="utf-8"))
+                evaluation = json.loads(
+                    Path(args.paper_model_evaluation).read_text(encoding="utf-8")
+                )
+                paper_strategy = PaperDirectionModelStrategy(
+                    model=model,
+                    evaluation=evaluation,
+                    confirmation=args.confirm_paper_model,
+                    symbol=args.coinswitch_symbol,
+                )
             market_info_body = (
                 Path(args.coinswitch_market_info_file).read_bytes()
                 if args.coinswitch_market_info_file is not None
@@ -390,8 +582,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 market_info_body=market_info_body,
                 market_info_max_age_hours=args.market_info_max_age_hours,
                 risk=None if profile is None else profile.risk,
+                strategy=paper_strategy,
             )
-        except (OSError, TypeError, ValueError) as exc:
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             parser.error(f"invalid CoinSwitch paper configuration: {exc}")
         return _serve_application(
             application,
