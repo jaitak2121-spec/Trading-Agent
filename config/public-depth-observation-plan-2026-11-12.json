@@ -1,0 +1,16 @@
+{
+  "schema": "public-depth-observation-plan/v1",
+  "symbol": "BTC/USDT",
+  "exchange": "c2c1",
+  "duration_seconds": 120,
+  "quote_notionals_at_mid": ["100", "500", "1000"],
+  "fee_bps": "10",
+  "verified_fee_snapshot_sha256": "c424f28653f585f89cc59926112010fe7deb0cb090773721832037c6b1f1a652",
+  "maximum_quote_age_ms": 5000,
+  "method": "Independent buy and sell static depth sweeps; base quantity equals quote notional divided by snapshot midpoint. No interpolation or assumed fills beyond displayed depth.",
+  "credentials_used": false,
+  "orders_executed": false,
+  "strategy_selection": false,
+  "live_cost_qualification": false,
+  "limitations": "Event-weighted short sample; liquidity may cancel. Poll receive timestamps cannot measure transport latency. No historical cost substitution or profitability conclusion."
+}

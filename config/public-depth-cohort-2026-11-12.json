@@ -1,0 +1,24 @@
+{
+  "schema": "public-depth-cohort-plan/v1",
+  "cohort_id": "public-depth-cohort-2026-11-12",
+  "symbol": "BTC/USDT",
+  "exchange": "c2c1",
+  "period_ids": ["period-1", "period-2", "period-3"],
+  "seconds_per_period": 120,
+  "pause_between_periods_seconds": 30,
+  "quote_notionals_at_mid": ["100", "500", "1000"],
+  "fee_bps_scenario": "10",
+  "quality_policy": {
+    "maximum_receive_gap_ms": 5000,
+    "maximum_clock_divergence_seconds": 2,
+    "minimum_fresh_unique_snapshots": 2,
+    "maximum_feed_error_polls": 0,
+    "maximum_reconnect_attempts": 0
+  },
+  "cohort_acceptance": "All three predefined periods must independently pass the unchanged 0.2.5 research quality gate. No replacement attempts or selection of passing windows. Do not pool costs if any period fails.",
+  "idle_sleep_inhibition": "Run under macOS caffeinate -i. This does not establish protection against forced sleep or clock changes.",
+  "credentials_used": false,
+  "orders_executed": false,
+  "live_cost_qualification": false,
+  "limitations": "Three nearby short windows are correlated and do not establish market-regime coverage, realized fill quality, strategy profitability or live readiness. No historical cost substitution."
+}

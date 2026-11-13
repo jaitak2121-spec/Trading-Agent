@@ -1,0 +1,22 @@
+{
+  "schema": "public-depth-timing-pilot-plan/v1",
+  "purpose": "One prospective measurement-boundary regression check after fixing transport-cleanup contamination; does not replace the failed three-period cohort.",
+  "symbol": "BTC/USDT",
+  "exchange": "c2c1",
+  "seconds": 120,
+  "attempts": 1,
+  "quote_notionals_at_mid": ["100", "500", "1000"],
+  "fee_bps_scenario": "10",
+  "quality_policy": {
+    "maximum_receive_gap_ms": 5000,
+    "maximum_clock_divergence_seconds": 2,
+    "minimum_fresh_unique_snapshots": 2,
+    "maximum_feed_error_polls": 0,
+    "maximum_reconnect_attempts": 0
+  },
+  "timing_method": "Both wall and monotonic observation end markers precede stream.stop; retain outer capture finish separately. Reject invalid/partial markers. Keep old cohort and its failures immutable.",
+  "credentials_used": false,
+  "orders_executed": false,
+  "live_cost_qualification": false,
+  "limitations": "A short successful pilot validates only this collection check, not multi-period qualification, future execution costs, or profitability."
+}
