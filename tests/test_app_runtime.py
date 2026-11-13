@@ -9,6 +9,8 @@ import json
 import io
 import threading
 import unittest
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 from contextlib import redirect_stderr
 from decimal import Decimal
 
@@ -49,6 +51,23 @@ class DemoMarketStreamTest(unittest.TestCase):
 
 
 class PaperApplicationRuntimeTest(unittest.TestCase):
+    def test_abbreviated_account_and_control_options_fail_before_composition(self):
+        from trading.app.__main__ import main
+        for args in (['--state-d', '/tmp/unopened-account.sqlite3'],
+                     ['--learning-r', '/tmp/unopened-learning'],
+                     ['--coinswitch-sy', 'BTC/USDT'], ['--resume-p'],
+                     ['--por', '9999'], ['--hos', 'localhost']):
+            with self.subTest(args=args), redirect_stderr(io.StringIO()), \
+                 patch('trading.app.__main__.build_paper_stack') as stack, \
+                 patch('trading.app.__main__.build_demo_paper_application') as demo, \
+                 patch('trading.app.__main__.build_coinswitch_paper_application') as real:
+                with self.assertRaises(SystemExit) as caught:
+                    main(args)
+                self.assertEqual(caught.exception.code, 2)
+                stack.assert_not_called()
+                demo.assert_not_called()
+                real.assert_not_called()
+
     def test_cli_refuses_invalid_limit_protection_before_network_start(self) -> None:
         from trading.app.__main__ import main
 
@@ -208,6 +227,49 @@ class PaperApplicationRuntimeTest(unittest.TestCase):
         app.stop()
         with self.assertRaises(RuntimeError):
             app.start()
+
+    def test_shutdown_releases_resources_after_transition_or_feed_failure(self):
+        from trading.app.runtime import PaperApplication
+        for failure in ('transition', 'stream'):
+            with self.subTest(failure=failure):
+                stack = SimpleNamespace(bot=Mock(state='paused'), operator_id='operator',
+                                        persistence=Mock())
+                stream, supervisor, server = Mock(), Mock(), Mock()
+                target = stack.bot.transition if failure == 'transition' else stream.stop
+                target.side_effect = RuntimeError(failure)
+                app = PaperApplication(stack, stream, Mock(), supervisor, Mock(), server)
+                with self.assertRaisesRegex(RuntimeError, failure):
+                    app.stop()
+                supervisor.stop.assert_called_once()
+                stream.stop.assert_called_once()
+                stack.persistence.close.assert_called_once()
+                self.assertTrue(app._closed)
+                app.stop()
+                stack.persistence.close.assert_called_once()
+
+    def test_shutdown_timeout_keeps_database_owned_until_worker_stops(self):
+        from trading.app.runtime import PaperApplication
+        stack = SimpleNamespace(bot=Mock(state='emergency_stopped'), operator_id='operator',
+                                persistence=Mock())
+        stream, supervisor, server = Mock(), Mock(), Mock()
+        supervisor.stop.side_effect = [RuntimeError('worker still running'), None]
+        app = PaperApplication(stack, stream, Mock(), supervisor, Mock(), server)
+        with self.assertRaisesRegex(RuntimeError, 'worker still running'):
+            app.stop()
+        stack.persistence.close.assert_not_called()
+        stream.stop.assert_not_called()
+        self.assertFalse(app._closed)
+        app.stop()
+        stack.bot.transition.assert_not_called()
+        stack.persistence.close.assert_called_once()
+
+    def test_cli_startup_failure_still_closes_application(self):
+        from trading.app.__main__ import _serve_application
+        app = Mock()
+        app.start.side_effect = OSError('dashboard port occupied')
+        with self.assertRaisesRegex(OSError, 'dashboard port occupied'):
+            _serve_application(app, description='isolated fixture')
+        app.stop.assert_called_once()
 
 
 if __name__ == "__main__":

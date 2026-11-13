@@ -8,6 +8,7 @@ import io
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from trading.adapters.marketdata import FeedDisconnected
@@ -55,6 +56,36 @@ class _FailingStream(_Stream):
 
 
 class CoinSwitchObservationTest(unittest.TestCase):
+    def test_wall_observation_boundary_precedes_transport_cleanup(self):
+        stream=_Stream([[{'bid':'1'}]],[[{'close':'1'}]])
+        clock=[1.0]
+        def stop():
+            clock[0]+=5
+            stream.stopped=True
+        stream.stop=stop
+        with patch('trading.app.coinswitch_observation.time.time_ns',
+                   side_effect=lambda:int(clock[0]*1000000000)):
+            report=run_coinswitch_observation(stream,duration_seconds=1,
+                monotonic=lambda:clock[0],wait=lambda seconds:clock.__setitem__(0,clock[0]+seconds))
+        self.assertEqual(report.duration_elapsed_seconds,1)
+        self.assertEqual(report.observation_started_at_ns,1000000000)
+        self.assertEqual(report.observation_finished_at_ns,2000000000)
+        self.assertEqual(clock[0],7)
+        self.assertTrue(stream.stopped)
+        self.assertEqual(report.as_details()['observation_finished_at_ns'],2000000000)
+
+    def test_quote_sink_records_messages_and_sink_failure_stops_stream(self):
+        stream=_Stream([[{'bid':'1'}]],[[{'close':'1'}]])
+        clock=[0.0];captured=[]
+        run_coinswitch_observation(stream,duration_seconds=1,monotonic=lambda:clock[0],
+            wait=lambda seconds:clock.__setitem__(0,clock[0]+seconds),quote_sink=captured.append)
+        self.assertEqual(captured,[{'bid':'1'}])
+        self.assertTrue(stream.stopped)
+        stream=_Stream([[{'bid':'1'}]],[[]])
+        def fail(message):raise ValueError('fixture sink failure')
+        with self.assertRaises(ValueError):run_coinswitch_observation(stream,duration_seconds=1,quote_sink=fail)
+        self.assertTrue(stream.stopped)
+
     def test_counts_both_channels_and_allows_a_recovered_interruption(self) -> None:
         stream = _Stream(
             [[{"bid": "1"}], FeedDisconnected("temporary"), [{"bid": "2"}]],

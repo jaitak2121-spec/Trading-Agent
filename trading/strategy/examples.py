@@ -101,6 +101,12 @@ class MovingAverageCrossover(SignalStrategy):
         """
         return max(self._slow + 1, self._atr_period + 1)
 
+    @property
+    def configuration(self):
+        return {'fast':self._fast, 'slow':self._slow, 'atr_period':self._atr_period,
+                'stop_atr_multiple':str(self._stop_multiple),
+                'reward_multiple':str(self._reward_multiple), 'symbols':self._symbols}
+
     def generate(self, context: MarketContext) -> list[Signal]:
         symbols = self._symbols if self._symbols is not None else context.tradable_symbols
         signals: list[Signal] = []

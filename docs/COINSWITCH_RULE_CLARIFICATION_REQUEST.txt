@@ -1,0 +1,20 @@
+To: api@coinswitch.co
+Subject: BTC/USDT c2c1 — exact quantity increment and precision.limit semantics
+
+Hello CoinSwitch API team,
+
+An authenticated GET /trade/api/v2/tradeInfo?exchange=c2c1&symbol=BTC/USDT
+captured at 2026-11-12T22:54:30.789593Z returned:
+{"quote":{"min":"5","max":"30000"},"precision":{"base":5,"quote":2,"limit":2}}
+
+Your documentation describes precision.limit as an adjustment but gives no
+formula. Please confirm for LIMIT orders:
+1. Exact valid quantity increment and price tick, and how limit=2 modifies base
+   or quote precision. Please provide valid/invalid examples and an official source.
+2. Any independent minimum BTC quantity/lot filter beyond quantity precision and
+   the 5-USDT minimum notional; if none, please explicitly confirm.
+3. Supported handling of a sub-step BTC residual (for example 0.00000178 BTC).
+
+We are validating a paper simulator; real order placement is disabled. We will
+not infer rules from another exchange or place trial orders to discover them.
+No credentials are attached. Thank you.

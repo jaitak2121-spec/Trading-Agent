@@ -171,6 +171,7 @@ class CoinSwitchSpotStreamTest(unittest.TestCase):
         second = dict(TRADE_1, E=1699423930000, p=102.5, q=0.20, t=2)
         next_minute = dict(TRADE_1, E=1699423980000, p=101.0, q=0.05, t=3)
         stream, connection = self.build([
+            packet("FETCH_TRADES_CS_PRO", dict(TRADE_1,E=1699423861000,t=0)),
             packet("FETCH_TRADES_CS_PRO", TRADE_1),
             packet("FETCH_TRADES_CS_PRO", second),
             packet("FETCH_TRADES_CS_PRO", next_minute),
@@ -187,6 +188,15 @@ class CoinSwitchSpotStreamTest(unittest.TestCase):
         self.assertEqual(message["close"], "102.5")
         self.assertEqual(message["volume"], "0.3")
         stream.stop()
+
+    def test_startup_trade_bucket_is_not_treated_as_complete(self):
+        stream=CoinSwitchSpotStream(symbol='BTC/INR')
+        self.assertIsNone(stream._aggregate_trade(TRADE_1))
+        self.assertIsNone(stream._aggregate_trade(dict(TRADE_1,E=1699423981000,t=2)))
+        self.assertIsNotNone(stream._aggregate_trade(dict(TRADE_1,E=1699424041000,t=3)))
+        stream._trade_bar=None  # Same boundary reset performed on reconnect.
+        self.assertIsNone(stream._aggregate_trade(dict(TRADE_1,E=1699424101000,t=4)))
+        self.assertIsNone(stream._aggregate_trade(dict(TRADE_1,E=1699424161000,t=5)))
 
     def test_translates_closed_candle_and_derives_open_time(self) -> None:
         stream, connection = self.build([packet("FETCH_CANDLESTICK_CS_PRO", CANDLE)])

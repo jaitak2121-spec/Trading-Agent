@@ -116,9 +116,9 @@ class BuildPaperStackTest(unittest.TestCase):
             Quantity("0.001", "BTC"),
         )
         self.assertEqual(restored.risk.submissions_in_window(), 1)
-        self.assertFalse(restored.startup.ok)
-        self.assertTrue(restored.reconciliation.has_mismatch)
-        self.assertFalse(restored.monitor.ready())
+        self.assertTrue(restored.startup.ok)
+        self.assertFalse(restored.reconciliation.has_mismatch)
+        self.assertEqual(restored.bot.state, 'paused')
         restored.audit.verify()
         restored.persistence.close()
 

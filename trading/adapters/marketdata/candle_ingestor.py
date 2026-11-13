@@ -114,6 +114,11 @@ class CandleIngestor:
         self._clock = clock
         self._last_open: dict[str, _dt.datetime] = {}
         self._interval: dict[str, int] = {}
+        for symbol in store.symbols():
+            previous=store.last(symbol)
+            if previous is not None:
+                self._last_open[symbol]=previous.open_time
+                self._interval[symbol]=previous.interval_seconds
         self._state = FeedState.CONNECTED
         self._passes = 0
         self._last_report: CandleIngestReport | None = None
@@ -180,6 +185,8 @@ class CandleIngestor:
             last = self._last_open.get(symbol)
             if last is not None and candle.open_time <= last:
                 if candle.open_time == last:
+                    verify=getattr(self._store,'verify_replay',None)
+                    if verify is not None:verify(candle)
                     duplicates += 1
                 else:
                     out_of_order += 1

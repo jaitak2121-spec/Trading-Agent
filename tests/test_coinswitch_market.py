@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import unittest
+from unittest.mock import Mock
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -14,6 +15,8 @@ from trading.app import (
     CoinSwitchTradeInfoTranslator,
 )
 from trading.core.money import INR, USDT, Money
+from trading.core.secrets import Secret
+from trading.adapters.coinswitch.historical_candles import CoinSwitchTradeInfoReader,CoinSwitchCandleTransportError
 
 
 def trade_info(
@@ -70,6 +73,30 @@ def capture(
 class CoinSwitchTradeInfoTranslatorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.translator = CoinSwitchTradeInfoTranslator()
+
+    def test_observed_c2c1_nonzero_limit_adjustment_is_not_silently_ignored(self):
+        body=trade_info(exchange='c2c1',symbol='BTC/USDT',minimum='5',maximum='30000',base=5,quote=2,limit=2)
+        with self.assertRaisesRegex(ValueError,'non-zero limit precision'):
+            self.translator.translate(body=body,exchange='c2c1',symbol='BTC/USDT',currency=USDT)
+
+    def test_metadata_reader_has_one_get_scope_and_no_fallback(self):
+        opener=Mock(return_value=(200,b'{"data":{}}'));signer=Mock(return_value='signature-fixture')
+        reader=CoinSwitchTradeInfoReader(api_key=Secret('metadata-test-key-value'),api_secret=Secret('metadata-test-secret-value'),
+            opener=opener,signer=signer,clock_ms=lambda:123)
+        self.assertEqual(reader.fetch(exchange='c2c1',symbol='BTC/USDT').statuses,(200,))
+        self.assertEqual(opener.call_args.args[0],'/trade/api/v2/tradeInfo?exchange=c2c1&symbol=BTC/USDT')
+        self.assertEqual(signer.call_args.args[1],b'GET/trade/api/v2/tradeInfo?exchange=c2c1&symbol=BTC/USDT123')
+        opener.reset_mock();opener.return_value=(401,b'error')
+        with self.assertRaises(CoinSwitchCandleTransportError):reader.fetch(exchange='c2c1',symbol='BTC/USDT')
+        opener.assert_called_once();opener.reset_mock()
+        with self.assertRaises(ValueError):reader.fetch(exchange='c2c1',symbol='BTC/USDT&path=orders')
+        opener.assert_not_called()
+
+    def test_metadata_http_exception_cannot_echo_credential_values(self):
+        reader=CoinSwitchTradeInfoReader(api_key=Secret('metadata-test-key-value'),api_secret=Secret('metadata-test-secret-value'),
+            opener=Mock(side_effect=RuntimeError('metadata-test-secret-value')),signer=lambda *_:'signature-fixture')
+        with self.assertRaises(CoinSwitchCandleTransportError) as raised:reader.fetch(exchange='c2c1',symbol='BTC/USDT')
+        self.assertNotIn('metadata-test-secret-value',str(raised.exception))
 
     def test_documented_trade_info_becomes_validated_market_specification(self) -> None:
         market = self.translator.translate(

@@ -26,6 +26,7 @@ from .paper_service import RealtimePaperService
 from .order_policy import MarketableLimitPolicy, VenueMarketSpecification
 from .coinswitch_market import CoinSwitchTradeInfoTranslator
 from .supervisor import PaperServiceSupervisor
+from .model_monitor import prediction_monitor, validate_monitor_policy
 
 __all__ = [
     "PaperApplication",
@@ -83,12 +84,30 @@ class PaperApplication:
             self.server.stop()
         finally:
             self.supervisor.stop()
-            stream_stop = getattr(self.stream, "stop", None)
-            if callable(stream_stop):
-                stream_stop()
-            if self.stack.persistence is not None:
-                self.stack.persistence.close()
-            self._closed = True
+            # Do not close persistence if the worker failed to stop: it may
+            # still be committing. Once joined, always release owned resources.
+            try:
+                if self.stack.bot.state != 'emergency_stopped':
+                    self.stack.bot.transition('stopped', self.stack.operator_id,
+                                              reason='application shutdown')
+            finally:
+                try:
+                    stream_stop = getattr(self.stream, "stop", None)
+                    if callable(stream_stop):
+                        stream_stop()
+                finally:
+                    if self.stack.persistence is not None:
+                        self.stack.persistence.close()
+                    self._closed = True
+
+    def pause(self, *, reason: str) -> None:
+        self.stack.bot.transition('paused', self.stack.operator_id, reason=reason)
+
+    def resume(self, *, reason: str) -> None:
+        self.stack.bot.transition('running', self.stack.operator_id, reason=reason)
+
+    def emergency_stop(self, *, reason: str) -> None:
+        self.stack.bot.transition('emergency_stopped', self.stack.operator_id, reason=reason)
 
     def __enter__(self) -> "PaperApplication":
         self.start()
@@ -102,10 +121,14 @@ def build_demo_paper_application(
     *,
     starting_cash: Money = Money("100000.00", USD),
     slippage_bps: int = 0,
+    fee_bps: int = 0,
     sqlite_path: str | PathLike[str] | None = None,
     poll_interval_seconds: float = 1.0,
     host: str = "127.0.0.1",
     port: int = 8765,
+    paper_controls: bool = False,
+    research_summary=None,
+    local_notifications: bool = False,
     risk: RiskConfig | None = None,
 ) -> PaperApplication:
     """Build a continuous synthetic paper app with no network market dependency."""
@@ -116,14 +139,22 @@ def build_demo_paper_application(
             raise ValueError("risk base currency must match starting cash")
     now = _dt.datetime.now(UTC).replace(microsecond=0)
     clock = ManualClock(now)
+    origin={'kind':'synthetic_demo','provider':'deterministic_demo','symbol':'DEMOUSD','exchange':None}
+    if sqlite_path is not None:
+        from ..adapters.persistence.sqlite import check_paper_origin
+        check_paper_origin(sqlite_path,origin)
     stack = build_paper_stack(
         starting_cash=starting_cash,
         risk=risk or _application_risk(),
         slippage_bps=slippage_bps,
+        fee_bps=fee_bps,
         sqlite_path=sqlite_path,
         clock=clock,
     )
     stream = DemoMarketStream(clock)
+    if stack.persistence is not None:
+        from ..adapters.persistence.sqlite import bind_paper_origin
+        bind_paper_origin(stack.persistence,origin)
     candles = InMemoryCandleStore()
     quotes = MarketDataIngestor(
         source=stream.quote_source,
@@ -160,10 +191,13 @@ def build_demo_paper_application(
     supervisor = PaperServiceSupervisor(
         service, interval_seconds=poll_interval_seconds
     )
+    if local_notifications:
+        from ..adapters.process import notify_local_operator
+        service._notification=notify_local_operator
     dashboard = OperatorDashboard(
-        stack, supervisor, strategy_name=service.strategy_name
+        stack, supervisor, strategy_name=service.strategy_name, research_summary=research_summary,data_origin=origin
     )
-    server = DashboardServer(dashboard, host=host, port=port)
+    server = DashboardServer(dashboard, host=host, port=port, paper_controls=paper_controls)
     return PaperApplication(stack, stream, service, supervisor, dashboard, server)
 
 
@@ -173,10 +207,16 @@ def build_coinswitch_paper_application(
     starting_cash: Money = Money("100000.00", USDT),
     exchange: str | None = None,
     slippage_bps: int = 0,
+    fee_bps: int = 0,
     sqlite_path: str | PathLike[str] | None = None,
     poll_interval_seconds: float = 1.0,
     host: str = "127.0.0.1",
     port: int = 8765,
+    paper_controls: bool = False,
+    research_summary=None,
+    model_monitor_policy=None,
+    learning_reports=None,
+    local_notifications: bool = False,
     stream: CoinSwitchSpotStream | None = None,
     limit_protection_bps: int = 10,
     limit_price_decimals: int = 2,
@@ -189,6 +229,8 @@ def build_coinswitch_paper_application(
     strategy: SignalStrategy | None = None,
 ) -> PaperApplication:
     """Build a real CoinSwitch-data application with paper-only execution."""
+    if model_monitor_policy is not None:
+        model_monitor_policy=validate_monitor_policy(model_monitor_policy)
     normalized_symbol = (
         stream.symbol if stream is not None and symbol is None
         else (symbol or "BTC/USDT").strip().upper()
@@ -228,6 +270,10 @@ def build_coinswitch_paper_application(
         raise ValueError("market_info_max_age_hours must be between 1 and 720")
 
     clock = SystemClock()
+    origin={'kind':'real_market_paper','candle_policy':'complete-connected-minutes/v1','provider':'CoinSwitch public feed','symbol':market_stream.symbol,'exchange':market_stream.exchange}
+    if sqlite_path is not None:
+        from ..adapters.persistence.sqlite import check_paper_origin
+        check_paper_origin(sqlite_path,origin)
     specification_values = (
         quantity_step,
         min_order_notional,
@@ -268,17 +314,45 @@ def build_coinswitch_paper_application(
         protection_bps=limit_protection_bps,
         price_decimals=limit_price_decimals,
         market=market,
+        require_verified_metadata=True,
     )
 
+    if strategy is not None and not isinstance(strategy, SignalStrategy):
+        raise TypeError("strategy must be a SignalStrategy or None")
+    selected_strategy = strategy or MovingAverageCrossover(
+        fast=3, slow=5, atr_period=3, symbols=[market_stream.symbol]
+    )
+    reference=getattr(selected_strategy,'monitor_reference',None)
+    monitor_identity=None
+    if reference is not None:
+        from .model_deployment import model_identity
+        if reference.get('symbol') != market_stream.symbol or reference.get('exchange') != market_stream.exchange:
+            raise ValueError('model market provenance does not match the configured feed')
+        monitor_identity=model_identity(reference)
     stack = build_paper_stack(
         starting_cash=starting_cash,
         risk=risk or _application_risk(currency),
         slippage_bps=slippage_bps,
+        fee_bps=fee_bps,
         sqlite_path=sqlite_path,
         clock=clock,
     )
-    candles = InMemoryCandleStore()
     source_name = f"coinswitch-{market_stream.exchange}"
+    stack.broker.market_rules_ready=lambda:order_policy.metadata_valid_at(clock.now())
+    def order_refusal(order,quote):
+        try:order_policy.validate_order(order.intent,quote,clock.now())
+        except (ValueError,TypeError,ArithmeticError) as exc:return str(exc)
+        return None
+    stack.broker.order_refusal=order_refusal
+    if stack.persistence is not None:
+        from ..adapters.persistence.sqlite import bind_paper_origin
+        bind_paper_origin(stack.persistence,origin)
+    if stack.persistence is not None:
+        from ..adapters.persistence.candles import SQLiteCandleStore
+        candles=SQLiteCandleStore(stack.persistence,symbol=market_stream.symbol,currency=currency,
+            asset=market_stream.base_asset,source=source_name,clock=clock)
+    else:
+        candles=InMemoryCandleStore()
     quotes = MarketDataIngestor(
         source=market_stream.quote_source,
         normalizer=QuoteNormalizer(
@@ -300,11 +374,6 @@ def build_coinswitch_paper_application(
         store=candles,
         clock=clock,
     )
-    if strategy is not None and not isinstance(strategy, SignalStrategy):
-        raise TypeError("strategy must be a SignalStrategy or None")
-    selected_strategy = strategy or MovingAverageCrossover(
-        fast=3, slow=5, atr_period=3, symbols=[market_stream.symbol]
-    )
     service = RealtimePaperService(
         stack,
         selected_strategy,
@@ -317,6 +386,15 @@ def build_coinswitch_paper_application(
     supervisor = PaperServiceSupervisor(
         service, interval_seconds=poll_interval_seconds
     )
+    from .experience_learning import learning_status
+    monitoring=None
+    if reference is not None:
+        monitoring=lambda: prediction_monitor(stack.audit.records(), monitor_identity, reference,
+                                               model_monitor_policy)
+    service._prediction_monitor=monitoring
+    if local_notifications:
+        from ..adapters.process import notify_local_operator
+        service._notification=notify_local_operator
     dashboard = OperatorDashboard(
         stack,
         supervisor,
@@ -324,8 +402,13 @@ def build_coinswitch_paper_application(
         market_specification=market,
         clock=clock,
         strategy_name=service.strategy_name,
+        research_summary=research_summary,
+        model_metadata=getattr(selected_strategy, 'model_metadata', None),
+        prediction_monitor=monitoring,
+        learning_status_provider=None if learning_reports is None else lambda:learning_status(learning_reports),
+        data_origin=origin,
     )
-    server = DashboardServer(dashboard, host=host, port=port)
+    server = DashboardServer(dashboard, host=host, port=port, paper_controls=paper_controls)
     return PaperApplication(
         stack, market_stream, service, supervisor, dashboard, server
     )

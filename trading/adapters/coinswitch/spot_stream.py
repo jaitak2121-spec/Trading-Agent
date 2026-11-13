@@ -72,6 +72,7 @@ class _TradeBar:
     low: Decimal
     close: Decimal
     volume: Decimal
+    coverage_complete: bool = False
 
 
 class _WebSocketConnection:
@@ -270,6 +271,7 @@ class CoinSwitchSpotStream:
         reconnect_initial_seconds: float = 1.0,
         reconnect_max_seconds: float = 30.0,
         connection_factory: Callable[[str, str, float], _TextConnection] | None = None,
+        include_depth: bool = False,
     ) -> None:
         if not isinstance(symbol, str) or symbol.count("/") != 1:
             raise ValueError("symbol must use CoinSwitch REST form BASE/QUOTE")
@@ -306,6 +308,9 @@ class CoinSwitchSpotStream:
         self._reconnect_initial = reconnect_initial
         self._reconnect_max = reconnect_max
         self._factory = connection_factory or _WebSocketConnection.connect
+        if type(include_depth) is not bool:
+            raise ValueError("include_depth must be boolean")
+        self._include_depth = include_depth
         self._quotes: queue.SimpleQueue[RawMessage] = queue.SimpleQueue()
         self._candles: queue.SimpleQueue[RawMessage] = queue.SimpleQueue()
         self.quote_source: MarketDataSource = _Source(self, "quote")
@@ -487,12 +492,15 @@ class CoinSwitchSpotStream:
         bid, ask = bids[0], asks[0]
         if not isinstance(bid, list) or not isinstance(ask, list):
             raise TypeError("order book levels are not arrays")
-        return {
+        result = {
             "symbol": self._normal_symbol(payload["s"]),
             "bid": bid[0],
             "ask": ask[0],
             "timestamp": payload["timestamp"],
         }
+        if self._include_depth:
+            result.update(bids=bids, asks=asks, exchange=self.exchange)
+        return result
 
     def _decode_candle(self, payload: Mapping[str, object]) -> RawMessage:
         interval_minutes = int(str(payload["interval"]))
@@ -545,9 +553,11 @@ class CoinSwitchSpotStream:
             "volume": str(current.volume),
         }
         self._trade_bar = _TradeBar(
-            bucket, price, price, price, price, quantity
+            bucket, price, price, price, price, quantity, True
         )
-        return closed
+        # The first observed bucket after startup/reconnect may have begun
+        # before subscription. It is not a full OHLCV minute and is never saved.
+        return closed if current.coverage_complete else None
 
     def _normal_symbol(self, value: object) -> str:
         symbol = str(value).replace(",", "/").upper()

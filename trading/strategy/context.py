@@ -89,6 +89,8 @@ class MarketContext:
                         f"{bar.symbol!r}"
                     )
             times = [bar.open_time for bar in bars]
+            if len(set(times)) != len(times):
+                raise ValueError(f"history for {symbol} contains duplicate candle timestamps")
             if times != sorted(times):
                 raise ValueError(
                     f"history for {symbol} is not in chronological order; "
@@ -134,7 +136,7 @@ class MarketContext:
     # -- history ----------------------------------------------------------
 
     def candles(self, symbol: str, *, count: int | None = None) -> tuple[Candle, ...]:
-        """Closed bars for ``symbol``, oldest first.
+        """Latest contiguous closed bars for ``symbol``, oldest first.
 
         An in-progress bar is excluded, so an indicator cannot be computed over a
         partial period. ``count`` returns the most recent ``count`` bars.
@@ -142,6 +144,13 @@ class MarketContext:
         bars = tuple(
             bar for bar in self.history.get(symbol, ()) if bar.is_complete(self.as_of)
         )
+        start=0
+        for index in range(len(bars)-1,0,-1):
+            if (bars[index-1].close_time != bars[index].open_time
+                    or bars[index-1].interval_seconds != bars[index].interval_seconds):
+                start=index
+                break
+        bars=bars[start:]
         if count is None:
             return bars
         if isinstance(count, bool) or not isinstance(count, int):

@@ -109,6 +109,7 @@ class PaperStack:
     gateway_id: Principal
     operator_id: Principal
     system_id: Principal
+    bot: object = None
 
 
 def build_paper_stack(
@@ -116,6 +117,7 @@ def build_paper_stack(
     starting_cash: Money = DEFAULT_STARTING_CASH,
     risk: RiskConfig | None = None,
     slippage_bps: int = 0,
+    fee_bps: int = 0,
     staleness: StalenessPolicy | None = None,
     clock: Clock | None = None,
     max_staleness_seconds: float = 300.0,
@@ -132,6 +134,8 @@ def build_paper_stack(
     deterministic CLI demo) drives time explicitly; pass a
     :class:`~trading.core.clock.SystemClock` for wall-clock operation.
     """
+    if isinstance(fee_bps, bool) or not isinstance(fee_bps, int) or not 0 <= fee_bps < 10000:
+        raise ValueError('fee_bps must be an integer from 0 to 9999')
     clock = clock or ManualClock()
     persistence = SQLiteState(sqlite_path) if sqlite_path is not None else None
     if persistence is None:
@@ -177,6 +181,7 @@ def build_paper_stack(
     reconciliation = ReconciliationGate(
         ledger, orders, audit, clock=clock, max_staleness_seconds=max_staleness_seconds
     )
+    portfolio.fee_bps = fee_bps
     if persistence is None:
         risk_engine = RiskEngine(
             config.risk, identity=risk_id, order_store=orders, audit=audit, clock=clock
@@ -193,9 +198,17 @@ def build_paper_stack(
     dedupe = IdempotencyRegistry(
         audit, clock=clock, repository=reservation_repository
     )
+    if config.risk.max_drawdown_fraction is not None:
+        risk_engine.observe_equity(portfolio.starting_cash)
     # No trigger file: the probe never reports a kill engaged from the filesystem.
     # engage() is the only way in, which is what a paper session wants.
     kill_switch = KillSwitch(audit, clock=clock, presence_probe=lambda _path: False)
+    for record in reversed(audit.records()):
+        if record.action == 'kill_switch_released':
+            break
+        if record.action == 'kill_switch_engaged':
+            kill_switch.engage(operator_id, reason=record.details['reason'])
+            break
     breakers = BreakerRegistry()
     breakers.add(
         CircuitBreaker(
@@ -207,6 +220,15 @@ def build_paper_stack(
     broker = PaperBroker(
         clock=clock, quotes=feed, slippage_bps=slippage_bps, staleness=staleness
     )
+    if persistence is not None:
+        from ..adapters.persistence.paper_broker import SQLitePaperBroker
+        broker = SQLitePaperBroker(
+            state=persistence, clock=clock, quotes=feed,
+            slippage_bps=slippage_bps, staleness=staleness,
+        )
+    broker.available_cash = lambda: portfolio.cash
+    broker.available_positions = portfolio.snapshot
+    broker.fee_bps = fee_bps
 
     modes = TradingModeMachine(config, audit)
     modes.transition_to(
@@ -270,7 +292,7 @@ def build_paper_stack(
         audit=audit,
     )
 
-    return PaperStack(
+    stack = PaperStack(
         clock=clock,
         audit=audit,
         sink=sink,
@@ -299,3 +321,15 @@ def build_paper_stack(
         operator_id=operator_id,
         system_id=system_id,
     )
+    from .paper_state import PaperBotState
+    bot = PaperBotState(stack)
+    object.__setattr__(stack, 'bot', bot)
+    gateway.submission_guard = bot.require_running
+    if persistence is not None:
+        from ..adapters.persistence.sqlite import read_paper_origin
+        origin=read_paper_origin(persistence.path)
+        if origin and origin.get('kind')=='real_market_paper':
+            broker.market_rules_ready=lambda:False  # Recovery-only composition cannot authorize fills.
+    broker.allow_fills = lambda: (bot.state == 'running' and not kill_switch.is_engaged
+        and getattr(broker,'market_rules_ready',lambda:True)())
+    return stack

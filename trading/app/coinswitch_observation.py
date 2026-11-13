@@ -46,6 +46,8 @@ class CoinSwitchObservationReport:
     successful_reconnects: int
     last_feed_error: str | None
     failures: tuple[str, ...] = ()
+    observation_started_at_ns: int | None = None
+    observation_finished_at_ns: int | None = None
 
     @property
     def passed(self) -> bool:
@@ -69,6 +71,8 @@ class CoinSwitchObservationReport:
             "successful_reconnects": self.successful_reconnects,
             "last_feed_error": self.last_feed_error,
             "failures": list(self.failures),
+            "observation_started_at_ns": self.observation_started_at_ns,
+            "observation_finished_at_ns": self.observation_finished_at_ns,
         }
 
     def render(self) -> str:
@@ -102,6 +106,7 @@ def run_coinswitch_observation(
     wait: Callable[[float], object] | None = None,
     monotonic: Callable[[], float] | None = None,
     candle_sink: Callable[[Mapping[str, object]], object] | None = None,
+    quote_sink: Callable[[Mapping[str, object]], object] | None = None,
 ) -> CoinSwitchObservationReport:
     """Observe both public channels for a fixed duration and stop the stream."""
     if not callable(getattr(stream, "start", None)) or not callable(
@@ -110,6 +115,8 @@ def run_coinswitch_observation(
         raise TypeError("stream must provide start() and stop()")
     if candle_sink is not None and not callable(candle_sink):
         raise TypeError("candle_sink must be callable or None")
+    if quote_sink is not None and not callable(quote_sink):
+        raise TypeError("quote_sink must be callable or None")
     for name, value in (
         ("duration_seconds", duration_seconds),
         ("poll_interval_seconds", poll_interval_seconds),
@@ -128,6 +135,7 @@ def run_coinswitch_observation(
     last_error: str | None = None
     ended_in_error = False
     started = clock()
+    wall_started = time.time_ns()
 
     try:
         stream.start()
@@ -146,6 +154,8 @@ def run_coinswitch_observation(
             successful_reconnects=stream.successful_reconnects,
             last_feed_error=message,
             failures=(f"public stream startup failed: {message}",),
+            observation_started_at_ns=wall_started,
+            observation_finished_at_ns=time.time_ns(),
         )
     observed_elapsed = 0.0
     try:
@@ -164,6 +174,9 @@ def run_coinswitch_observation(
                     count = len(messages)
                     if kind == "quote":
                         quotes += count
+                        if quote_sink is not None:
+                            for message in messages:
+                                quote_sink(message)
                     else:
                         candles += count
                         if candle_sink is not None:
@@ -186,6 +199,7 @@ def run_coinswitch_observation(
         # The transport may need a bounded join while closing. That is cleanup
         # time, not market-observation time, so snapshot elapsed first.
         observed_elapsed = max(0.0, clock() - started)
+        wall_finished = time.time_ns()
         stream.stop()
 
     failures: list[str] = []
@@ -208,4 +222,6 @@ def run_coinswitch_observation(
         successful_reconnects=stream.successful_reconnects,
         last_feed_error=last_error,
         failures=tuple(failures),
+        observation_started_at_ns=wall_started,
+        observation_finished_at_ns=wall_finished,
     )
