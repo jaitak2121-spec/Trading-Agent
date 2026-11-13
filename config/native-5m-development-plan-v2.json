@@ -1,0 +1,225 @@
+{
+  "acceptance": {
+    "bootstrap": {
+      "block_trades": 10,
+      "candidate_count": 6,
+      "familywise_alpha": 0.05,
+      "replicates": 2000,
+      "seed": 0
+    },
+    "max_drawdown_each_fold": ".10",
+    "minimum_closed_trades_each_cost": 100,
+    "minimum_folds": 6,
+    "minimum_positive_folds_each_cost": 5,
+    "positive_mean_net_and_excess_returns_each_cost": true,
+    "positive_trade_pnl_interval_each_cost": true
+  },
+  "buy_hold_allocation": ".1",
+  "candidates": {
+    "breakout": {
+      "configuration": {
+        "atr_period": 14,
+        "breakout_bars": 20,
+        "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+        "exit_channel_bars": 10,
+        "minimum_stop_fraction": "0.0052",
+        "pullback_bars": 20,
+        "pullback_target_atr_multiple": "4",
+        "rule": "breakout",
+        "stop_atr_multiple": "2",
+        "trend_bars": 50
+      },
+      "name": "cost-research-breakout"
+    },
+    "ma-crossover": {
+      "configuration": {
+        "atr_period": 14,
+        "fast": 10,
+        "reward_multiple": "2",
+        "slow": 30,
+        "stop_atr_multiple": "2",
+        "symbols": null
+      },
+      "name": "ma-crossover"
+    },
+    "mean-reversion": {
+      "configuration": {
+        "atr_period": 14,
+        "lookback": 30,
+        "range_filter": "0.01",
+        "reward_multiple": "2",
+        "rule": "mean-reversion",
+        "stop_atr_multiple": "2",
+        "threshold": "0.005"
+      },
+      "name": "research-mean-reversion"
+    },
+    "momentum": {
+      "configuration": {
+        "atr_period": 14,
+        "lookback": 30,
+        "range_filter": "0.01",
+        "reward_multiple": "2",
+        "rule": "momentum",
+        "stop_atr_multiple": "2",
+        "threshold": "0.005"
+      },
+      "name": "research-momentum"
+    },
+    "trend-pullback": {
+      "configuration": {
+        "atr_period": 14,
+        "breakout_bars": 20,
+        "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+        "exit_channel_bars": 10,
+        "minimum_stop_fraction": "0.0052",
+        "pullback_bars": 20,
+        "pullback_target_atr_multiple": "4",
+        "rule": "trend-pullback",
+        "stop_atr_multiple": "2",
+        "trend_bars": 50
+      },
+      "name": "cost-research-trend-pullback"
+    },
+    "volatility-filtered-momentum": {
+      "configuration": {
+        "atr_period": 14,
+        "lookback": 30,
+        "range_filter": "0.01",
+        "reward_multiple": "2",
+        "rule": "volatility-filtered-momentum",
+        "stop_atr_multiple": "2",
+        "threshold": "0.005"
+      },
+      "name": "research-volatility-filtered-momentum"
+    }
+  },
+  "confirmation_accessed": false,
+  "costs_bps": {
+    "base": [
+      "10",
+      "2",
+      "2"
+    ],
+    "stress": [
+      "20",
+      "5",
+      "4"
+    ]
+  },
+  "derived_integrity": [
+    {
+      "candle_sha256": "5aab49056c68cf8dd4f9b8403bd85f631995431054fc13827ac436e91824cf1a",
+      "dataset_sha256": "1085076794cfba44a586c2d68e8ad78acf4c051d70a44ae89875106e24236096",
+      "eligible_for_strategy_qualification": true,
+      "evidence_sha256": "cc6e763e7071f870ed118ed8fdb46f99b5f6ba8bed692659753096d7d1ab53d0",
+      "expected_candles": 28952,
+      "failures": [],
+      "policy": "full requested range; no interpolation, cross-source patches or implicit gap waiver",
+      "schema": "research-dataset-eligibility/v1"
+    },
+    {
+      "candle_sha256": "ce2d8a075603603aa32a304ec1093e3bf6a45645ec8e709b8c8c1a09e947914e",
+      "dataset_sha256": "8652156b2874b36b4f5f467bc898b6c0023f8c7c5f2a02f97dfb341d2ff95a13",
+      "eligible_for_strategy_qualification": true,
+      "evidence_sha256": "d343bc3010265c1bc25f90a33ebc379312d7f4b888619e629c2a84ea5b1e8af9",
+      "expected_candles": 22885,
+      "failures": [],
+      "policy": "full requested range; no interpolation, cross-source patches or implicit gap waiver",
+      "schema": "research-dataset-eligibility/v1"
+    }
+  ],
+  "features_or_parameters_tuned": false,
+  "final_test_accessed": false,
+  "folds": [
+    {
+      "fold_id": "run-1-1749081600000",
+      "run_id": 1,
+      "train_end_ms": 1749081600000,
+      "train_start_ms": 1746489600000,
+      "validation_end_ms": 1750377600000,
+      "validation_start_ms": 1749081600000
+    },
+    {
+      "fold_id": "run-1-1750377600000",
+      "run_id": 1,
+      "train_end_ms": 1750377600000,
+      "train_start_ms": 1747785600000,
+      "validation_end_ms": 1751673600000,
+      "validation_start_ms": 1750377600000
+    },
+    {
+      "fold_id": "run-1-1751673600000",
+      "run_id": 1,
+      "train_end_ms": 1751673600000,
+      "train_start_ms": 1749081600000,
+      "validation_end_ms": 1752969600000,
+      "validation_start_ms": 1751673600000
+    },
+    {
+      "fold_id": "run-1-1752969600000",
+      "run_id": 1,
+      "train_end_ms": 1752969600000,
+      "train_start_ms": 1750377600000,
+      "validation_end_ms": 1754265600000,
+      "validation_start_ms": 1752969600000
+    },
+    {
+      "fold_id": "run-2-1757768100000",
+      "run_id": 2,
+      "train_end_ms": 1757768100000,
+      "train_start_ms": 1755176100000,
+      "validation_end_ms": 1759064100000,
+      "validation_start_ms": 1757768100000
+    },
+    {
+      "fold_id": "run-2-1759064100000",
+      "run_id": 2,
+      "train_end_ms": 1759064100000,
+      "train_start_ms": 1756472100000,
+      "validation_end_ms": 1760360100000,
+      "validation_start_ms": 1759064100000
+    },
+    {
+      "fold_id": "run-2-1760360100000",
+      "run_id": 2,
+      "train_end_ms": 1760360100000,
+      "train_start_ms": 1757768100000,
+      "validation_end_ms": 1761656100000,
+      "validation_start_ms": 1760360100000
+    }
+  ],
+  "implementation_sha256": {
+    "trading/app/backtest.py": "1d0d80aa87de575def91effcd7f67c637e31781aa726e57f1dc8576d3eff7cf4",
+    "trading/app/complete_runs.py": "5c76cc822637b40385bb550622f3b4a7dad72d3c96dd358a2d576bc5cafbf3cd",
+    "trading/app/cost_research.py": "59a3fe9eaf462936f684e725e04e42df969c01bc10046cef725e591c726901e7",
+    "trading/app/dataset_eligibility.py": "904df955fc073d25bf1c523841fef5d922dd15d0d7a0a17b56faf864fb230b99",
+    "trading/app/native_research.py": "009fbd6262d4d6978ce80b4f0e787d2ee7b546ed6765e0ab521c3e1de1ef723d",
+    "trading/core/config.py": "c69396f625abbcce21fafc5331d95284284a380250d1a4b0d02aa509f7d052a8",
+    "trading/core/money.py": "2beac98bafd84ebb2da0ab5016902b6c682125e070622f41064ea4bb30a649d5",
+    "trading/strategy/context.py": "bb1d04d0be58e5ac4ef850dd629163280a51886cb856dfa413ad6033f9377f39",
+    "trading/strategy/cost_aware.py": "552d80c002415e77e050bb95d84df3e509413c427e0a1b75020f93fbb28c29c0",
+    "trading/strategy/examples.py": "0ee003dddbfc797f71d2c6c0ad57bb85ac8f4d628c88c00c5bb4fb81a54a5cbf",
+    "trading/strategy/indicators.py": "7cefe7ef52f151f7de1aa7b4794bfc7c154cd78a2bfe41011d7c3c6b13bbd72c",
+    "trading/strategy/research.py": "d847227505056713c6de2b49112883552305d93a02f18d986f7adac8e79aa5b5"
+  },
+  "limitations": [
+    "native five-minute stop/target ordering is conservative stop-first; minute path unavailable",
+    "older historical development data is not prospective confirmation",
+    "account fees are assumptions; tax/TDS/depth/latency not modeled",
+    "complete derivatives do not repair the incomplete parent",
+    "independent confirmation and forward paper evidence required; no deployment"
+  ],
+  "max_daily_loss": "100",
+  "max_notional": "1000",
+  "model_fitting": false,
+  "native_interval_seconds": 300,
+  "parent_file_sha256": "e7aca21f39fac23a2340ae0c22d5bad8a06bdbd063573055adcc3336579eda2f",
+  "python": "3.11.15",
+  "risk_fraction": ".005",
+  "schema": "native-five-minute-development-plan/v1",
+  "scope": "development_only",
+  "starting_equity": "10000",
+  "validation_days": 15,
+  "warmup_days": 30
+}
