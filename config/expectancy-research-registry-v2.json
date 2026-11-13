@@ -1,0 +1,47 @@
+{
+  "experiments": [
+    {
+      "id": "stage1-cost-targeted-5m",
+      "plan": "artifacts/research-registry/net-expectancy-stage1-plan.json",
+      "results": "artifacts/net-expectancy-stage1-results",
+      "source_snapshot": "artifacts/research-registry/net-expectancy-stage1-source"
+    },
+    {
+      "id": "stage2-native-hourly",
+      "plan": "artifacts/research-registry/hourly-expectancy-stage2-plan.json",
+      "results": "artifacts/hourly-expectancy-stage2-results",
+      "source_snapshot": "artifacts/research-registry/hourly-expectancy-stage2-source"
+    },
+    {
+      "id": "stage3-cross-market",
+      "plan": "artifacts/research-registry/cross-market-expectancy-stage3-plan.json",
+      "results": "artifacts/cross-market-expectancy-stage3-results",
+      "source_snapshot": "artifacts/research-registry/cross-market-expectancy-stage3-source"
+    },
+    {
+      "id": "stage4-nested-adaptive",
+      "plan": "artifacts/research-registry/adaptive-expectancy-stage4-plan.json",
+      "results": "artifacts/adaptive-expectancy-stage4-results",
+      "source_snapshot": "artifacts/research-registry/adaptive-expectancy-stage4-source"
+    },
+    {
+      "id": "stage5-funding-adaptive",
+      "plan": "artifacts/research-registry/funding-adaptive-stage5-plan.json",
+      "results": "artifacts/funding-adaptive-stage5-results",
+      "source_snapshot": "artifacts/research-registry/funding-adaptive-stage5-source"
+    },
+    {
+      "id": "stage6-decision-optimization",
+      "plan": "artifacts/research-registry/decision-expectancy-stage6-plan-v2.json",
+      "results": "artifacts/decision-expectancy-stage6-results",
+      "source_snapshot": "artifacts/research-registry/decision-expectancy-stage6-source-v2"
+    },
+    {
+      "id": "stage7-lagged-order-flow",
+      "plan": "artifacts/research-registry/flow-expectancy-stage7-plan.json",
+      "results": "artifacts/flow-expectancy-stage7-results",
+      "source_snapshot": "artifacts/research-registry/flow-expectancy-stage7-source"
+    }
+  ],
+  "schema": "net-expectancy-registry-specification/v1"
+}
