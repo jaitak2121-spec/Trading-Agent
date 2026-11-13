@@ -8,6 +8,8 @@ import json
 import tempfile
 import threading
 import unittest
+import os
+from unittest.mock import patch
 
 from trading.app import (
     DashboardServer,
@@ -19,7 +21,8 @@ from trading.app import (
 )
 from trading.core.clock import UTC, ManualClock
 from trading.core.errors import ConfigurationError, SafetyViolation
-from trading.core.money import Money, USD
+from trading.core.money import Money, Price, Quantity, USD
+from trading.core.orders import OrderSide
 
 
 class IdleService:
@@ -65,10 +68,37 @@ class OperatorDashboardTest(unittest.TestCase):
         self.assertFalse(snapshot["application"]["live_trading"])
         self.assertEqual(snapshot["application"]["strategy"], "test-strategy")
         self.assertEqual(snapshot["portfolio"]["currency"], "USD")
+        self.assertEqual(snapshot["portfolio"]["equity"], "1000000.00")
+        self.assertEqual(snapshot["portfolio"]["drawdown"], "0")
+        self.assertEqual(snapshot["portfolio"]["unrealized_pnl"], "0")
+        self.assertEqual(snapshot["trades"], [])
+        self.assertFalse(snapshot["risk"]["kill_switch"]["engaged"])
+        self.assertEqual(snapshot["ml"]["status"], "no_active_approved_model")
         self.assertIn("operations", snapshot)
         self.assertIn("orders", snapshot)
         self.assertIn("audit", snapshot)
         json.dumps(snapshot)
+
+    def test_snapshot_marks_positions_and_tracks_session_drawdown(self) -> None:
+        stack = build_paper_stack()
+        supervisor = PaperServiceSupervisor(IdleService())
+        dashboard = OperatorDashboard(stack, supervisor)
+        stack.portfolio.apply_fill(
+            "BTCUSD", OrderSide.BUY, Quantity("1", "BTC"), Price("100", USD)
+        )
+        stack.feed.publish("BTCUSD", Price("109", USD), Price("111", USD))
+
+        high = dashboard.snapshot()["portfolio"]
+        self.assertEqual(high["equity"], "1000010.00")
+        self.assertEqual(high["unrealized_pnl"], "10.00")
+        self.assertEqual(high["positions"][0]["mark_price"], "110")
+        self.assertEqual(high["drawdown"], "0")
+
+        stack.feed.publish("BTCUSD", Price("89", USD), Price("91", USD))
+        low = dashboard.snapshot()["portfolio"]
+        self.assertEqual(low["equity"], "999990.00")
+        self.assertEqual(low["unrealized_pnl"], "-10.00")
+        self.assertGreater(float(low["drawdown"]), 0)
 
     def test_audit_limit_is_applied_to_the_tail(self) -> None:
         stack = build_paper_stack()
@@ -250,6 +280,10 @@ class DashboardHTTPTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertIn("Trading App", body)
         self.assertIn("<th>Filled / ordered</th>", body)
+        self.assertIn("Filled trade history", body)
+        self.assertIn("Risk controls", body)
+        self.assertIn("ML status", body)
+        self.assertIn('id="equity"', body)
         self.assertIn("d.market_data.running&&!d.market_data.last_error", body)
         self.assertEqual(response.getheader("Cache-Control"), "no-store")
 
@@ -266,6 +300,54 @@ class DashboardHTTPTest(unittest.TestCase):
         self.assertEqual(response.status, 503)
         self.assertFalse(payload["healthy"])
 
+    def test_startup_probe_waits_for_worker_and_is_independent_of_trade_health(self):
+        stack = self.server._dashboard._stack
+        stack.bot.transition('paused', stack.operator_id, reason='isolated startup fixture')
+        self.connection.request('GET', '/readyz')
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 503)
+        self.assertFalse(json.loads(response.read())['ready'])
+        self.supervisor.start()
+        for _ in range(100):
+            if self.supervisor.status().passes:
+                break
+            threading.Event().wait(.01)
+        # This fixture is deliberately paused: trading health stays blocked.
+        self.connection.request('GET', '/readyz')
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read())['pid'], os.getpid())
+        from trading.adapters.http.dashboard import wait_for_paper_readiness
+        wait_for_paper_readiness(os.getpid(), port=self.server.address[1],
+                                 origin='unverified_paper', timeout_seconds=1)
+        self.connection.request('GET', '/healthz')
+        response = self.connection.getresponse()
+        self.assertEqual(response.status, 503)
+        response.read()
+
+    def test_snapshot_and_probe_fail_closed_without_exposing_exception(self):
+        with patch.object(self.server._dashboard, 'snapshot', side_effect=ValueError('private detail')):
+            for path in ('/api/snapshot', '/readyz'):
+                self.connection.request('GET', path)
+                response = self.connection.getresponse()
+                self.assertEqual(response.status, 503)
+                self.assertNotIn('private detail', response.read().decode())
+        with patch.object(self.server._dashboard, 'healthy', side_effect=ValueError('private detail')):
+            self.connection.request('GET', '/healthz')
+            response = self.connection.getresponse()
+            self.assertEqual(response.status, 503)
+            self.assertFalse(json.loads(response.read())['healthy'])
+
+    def test_thread_start_failure_releases_bound_socket(self):
+        server = DashboardServer(self.server._dashboard, port=0)
+        with patch('trading.adapters.http.dashboard.threading.Thread.start',
+                   side_effect=RuntimeError('thread unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'thread unavailable'):
+                server.start()
+        self.assertIsNone(server.address)
+        server.start()
+        server.stop()
+
     def test_mutation_is_not_exposed_and_unknown_routes_are_404(self) -> None:
         self.connection.request("POST", "/api/orders", body=b"{}")
         response = self.connection.getresponse()
@@ -280,6 +362,38 @@ class DashboardHTTPTest(unittest.TestCase):
     def test_starting_twice_is_refused(self) -> None:
         with self.assertRaises(SafetyViolation):
             self.server.start()
+
+
+class PaperControlHTTPTest(unittest.TestCase):
+    def test_token_origin_and_host_are_required_and_pause_is_audited(self):
+        dashboard, supervisor = build_dashboard()
+        server = DashboardServer(dashboard, port=0, paper_controls=True)
+        try:
+            server.start()
+        except PermissionError:
+            self.skipTest('environment forbids loopback socket binding')
+        try:
+            host, port = server.address
+            origin = f'http://{host}:{port}'
+            for token, request_origin, expected in [('', origin, 403),
+                    (server._control_token, 'http://malicious.example', 403),
+                    (server._control_token, origin, 200)]:
+                connection = http.client.HTTPConnection(host, port)
+                try:
+                    connection.request('POST', '/api/paper-control',
+                        body=json.dumps({'state':'paused', 'reason':'operator test'}),
+                        headers={'Content-Type':'application/json', 'Origin':request_origin,
+                                 'X-Paper-Control':token})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected)
+                    response.read()
+                finally:
+                    connection.close()
+            self.assertEqual(dashboard._stack.bot.state, 'paused')
+            self.assertEqual(dashboard._stack.broker.placement_count, 0)
+        finally:
+            server.stop()
+            supervisor.stop()
 
 
 if __name__ == "__main__":
