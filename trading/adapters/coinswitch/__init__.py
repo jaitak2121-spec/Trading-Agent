@@ -1,7 +1,7 @@
 """CoinSwitch public market-data adapters.
 
-Only the unauthenticated Spot Socket.IO stream is implemented here.  This
-package contains no order transport and accepts no API credentials.
+The public stream, separate GET-only historical downloader and offline Spot
+contract tools live here. There is no HTTP order transport or live launcher.
 """
 
 from __future__ import annotations
