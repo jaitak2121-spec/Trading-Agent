@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "operation": "development_candidate",
+  "interval_seconds": 86400,
+  "timeout_seconds": 600,
+  "cpu_seconds": 300,
+  "memory_mb": 2048,
+  "output_directory": "artifacts/scheduled-development",
+  "note": "Before enabling, supply hash-bound development, walk_forward, preregistration inputs and an exact preregistered candidate. Never supply confirmation or final-test data."
+}

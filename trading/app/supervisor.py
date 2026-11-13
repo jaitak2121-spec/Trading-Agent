@@ -152,12 +152,23 @@ class PaperServiceSupervisor:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
-                cycle = self._service.poll_once()
+                stack = getattr(self._service, '_stack', None)
+                if stack is not None and stack.bot.state != 'running':
+                    collector=getattr(self._service,'collect_only',None)
+                    if collector is None:
+                        self._stop.wait(self._interval)
+                        continue
+                    cycle=collector()
+                else:
+                    cycle = self._service.poll_once()
                 with self._lock:
                     self._last_cycle = cycle
                     self._passes += 1
                 self._stop.wait(self._interval)
         except BaseException as exc:  # noqa: BLE001 - worker failure is reported
+            stack = getattr(self._service, '_stack', None)
+            if stack is not None:
+                stack.kill_switch.engage(stack.system_id, reason='paper worker failed')
             message = global_redactor().redact(f"{type(exc).__name__}: {exc}")
             with self._lock:
                 self._last_error = message

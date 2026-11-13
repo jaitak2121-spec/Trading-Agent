@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "operation": "public_observation",
+  "interval_seconds": 3600,
+  "timeout_seconds": 900,
+  "cpu_seconds": 300,
+  "memory_mb": 512,
+  "observation_seconds": 600,
+  "symbol": "BTC/USDT",
+  "exchange": "c2c1",
+  "output_directory": "artifacts/scheduled-public-observations"
+}
