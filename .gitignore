@@ -173,6 +173,15 @@ obj/
 *.sqlite
 *.sqlite3
 *.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.lock
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock
+*.db-wal
+*.db-shm
+*.db.lock
 *.rdb
 *.dump
 *.sql.gz
@@ -259,3 +268,9 @@ ipython_config.py
 # ---------------------------------------------------------------------------
 .claude/.cc-writes/
 .claude/settings.local.json
+# Account-specific fee captures are local; never include them in research commits.
+artifacts/private-fees/
+
+# Local market data, protected research, runtime and account evidence.
+# Publish reviewed portable packages under releases/ instead.
+/artifacts/
