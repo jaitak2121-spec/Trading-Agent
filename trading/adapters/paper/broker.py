@@ -75,7 +75,7 @@ from typing import Mapping
 from ...core.authz import ExecutionToken
 from ...core.clock import Clock
 from ...core.marketdata import Quote, StalenessPolicy
-from ...core.money import FINANCIAL_CONTEXT, Price, Quantity
+from ...core.money import FINANCIAL_CONTEXT, ROUND_UP, ROUND_DOWN, Money, Price, Quantity
 from ...core.orders import Order, OrderSide, OrderType
 from ...ports.broker import (
     AckOutcome,
@@ -338,6 +338,8 @@ class PaperBroker(BrokerPort, BrokerOrderInventoryPort):
         one is a contradiction it refuses outright -- correctly, since at a real
         venue it would mean the answer was about somebody else's order.
         """
+        if not getattr(self, 'allow_fills', lambda: True)():
+            return held
         decided = self._decide(order, identity=held.broker_order_id)
         if decided.outcome is not AckOutcome.FILLED:
             return held
@@ -357,6 +359,8 @@ class PaperBroker(BrokerPort, BrokerOrderInventoryPort):
         how often someone looked rather than how many orders arrived.
         """
         now = self._clock.now()
+        if not getattr(self,'allow_fills',lambda:True)():
+            return _reject('paper_execution_blocked','paper state or current market rules prevent a new fill')
         quote = self._quotes.quote(order.symbol)
         if quote is None:
             return _reject(
@@ -371,6 +375,10 @@ class PaperBroker(BrokerPort, BrokerOrderInventoryPort):
             )
 
         executable = self._executable_price(quote, order.side)
+        validator=getattr(self,'order_refusal',None)
+        if validator is not None:
+            reason=validator(order,quote)
+            if reason:return _reject('market_rules',reason)
         limit = order.intent.limit_price
         if limit is not None:
             if limit.currency != executable.currency:
@@ -405,6 +413,22 @@ class PaperBroker(BrokerPort, BrokerOrderInventoryPort):
             return self._resting(f"no depth available in {order.symbol}", identity)
 
         partial = "" if fillable == ordered else f"partial fill: {fillable} of {ordered}"
+        cash_provider = getattr(self, 'available_cash', None)
+        positions_provider = getattr(self, 'available_positions', None)
+        if cash_provider is not None:
+            with decimal.localcontext(FINANCIAL_CONTEXT):
+                fee = Money.rounded(executable.amount * fillable.amount * Decimal(getattr(self, 'fee_bps', 0))
+                                    / Decimal(10000), executable.currency, rounding=ROUND_UP)
+            cash = cash_provider()
+            if order.side is OrderSide.BUY:
+                if executable.notional(fillable, rounding=ROUND_UP) + fee > cash:
+                    return _reject('insufficient_cash', 'virtual spot balance cannot cover fill and fees')
+            elif cash + executable.notional(fillable, rounding=ROUND_DOWN) < fee:
+                return _reject('insufficient_cash', 'virtual spot balance cannot cover sell fees')
+        if order.side is OrderSide.SELL and positions_provider is not None:
+            held = positions_provider().get(order.symbol, Quantity.zero(ordered.asset))
+            if held.asset != fillable.asset or held.amount < fillable.amount:
+                return _reject('insufficient_position', 'virtual spot position cannot cover sell fill')
         return BrokerAck(
             AckOutcome.FILLED,
             broker_order_id=identity if identity is not None else self._next_id(),

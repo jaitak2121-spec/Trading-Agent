@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import unittest
+from dataclasses import replace
+from decimal import Decimal
 
 from trading.app import MarketableLimitPolicy, VenueMarketSpecification
 from trading.core.clock import UTC
@@ -23,6 +25,26 @@ def quote(*, bid: str = "49", ask: str = "51") -> Quote:
 
 
 class MarketableLimitPolicyTest(unittest.TestCase):
+    def test_verified_policy_blocks_missing_unverified_expired_and_future_metadata(self):
+        q=quote();at=q.as_of
+        market=VenueMarketSpecification(price_decimals=2,quantity_step=Decimal('.00001'),min_notional=Money('5',USD),
+            max_notional=Money('30000',USD),metadata_source='/trade/api/v2/tradeInfo',
+            captured_at=at-dt.timedelta(hours=1),valid_until=at+dt.timedelta(hours=1))
+        for metadata in (None,replace(market,captured_at=None,valid_until=None),
+                         replace(market,valid_until=at-dt.timedelta(seconds=1)),
+                         replace(market,captured_at=at+dt.timedelta(minutes=1))):
+            policy=MarketableLimitPolicy(market=metadata,require_verified_metadata=True)
+            self.assertFalse(policy.metadata_valid_at(at))
+            with self.assertRaises(ValueError):policy.prepare(OrderSide.SELL,q,Quantity('1','BTC'))
+        self.assertTrue(MarketableLimitPolicy(market=market,require_verified_metadata=True).metadata_valid_at(at))
+
+    def test_minimum_notional_uses_exact_product_not_rounded_money(self):
+        market=VenueMarketSpecification(price_decimals=2,quantity_step=Decimal('.00000001'),min_notional=Money('10',USD),
+            max_notional=Money('100',USD))
+        policy=MarketableLimitPolicy(protection_bps=0,market=market)
+        q=quote(bid='100',ask='100')
+        with self.assertRaises(ValueError):policy.prepare(OrderSide.SELL,q,Quantity('.09999999','BTC'))
+        self.assertEqual(policy.prepare(OrderSide.SELL,q,Quantity('.1','BTC'))[0].amount,Decimal('.1'))
     def specification(
         self, *, minimum: str = "0.05", maximum: str = "1.00"
     ) -> VenueMarketSpecification:

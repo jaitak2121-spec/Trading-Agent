@@ -22,6 +22,33 @@ from ..core.orders import OrderSide
 __all__ = ["MarketableLimitPolicy", "VenueMarketSpecification"]
 
 
+def bounded_exit_quantity(held, *, ceiling, valuation_price, limit_price=None, market=None):
+    """A downward-rounded exit chunk; neither risk nor venue limits are waived."""
+    if not held.is_positive:raise ValueError('exit requires positive available quantity')
+    if ceiling.currency!=valuation_price.currency:raise ValueError('exit valuation currency mismatch')
+    step=market.quantity_step if market is not None else Decimal('0.00000001')
+    if market is not None:
+        if market.max_notional.currency!=ceiling.currency:raise ValueError('exit market currency mismatch')
+        ceiling=min(ceiling,market.max_notional)
+    if limit_price is not None and limit_price.currency!=valuation_price.currency:raise ValueError('exit limit currency mismatch')
+    price=max(valuation_price,limit_price) if limit_price is not None else valuation_price
+    with decimal.localcontext(FINANCIAL_CONTEXT):
+        tradeable=held.floor_to_step(step)
+        amount=min(tradeable.amount,ceiling.amount/price.amount)
+        quantity=Quantity(amount.quantize(Decimal('0.000000000001'),rounding=ROUND_DOWN),held.asset,max_scale=12).floor_to_step(step)
+        if market is not None and quantity.amount<tradeable.amount:
+            minimum_price=limit_price or valuation_price
+            remaining=tradeable.amount-quantity.amount
+            if remaining*minimum_price.amount<market.min_notional.amount:
+                minimum_steps=(market.min_notional.amount/minimum_price.amount/step).to_integral_value(ROUND_UP)
+                quantity=Quantity(tradeable.amount-minimum_steps*step,held.asset,max_scale=12).floor_to_step(step)
+        if quantity.is_zero or quantity.amount<0:raise ValueError('remaining position cannot form a compliant exit chunk')
+        if price.notional(quantity)>ceiling:raise ValueError('exit chunk exceeds notional ceiling')
+        if market is not None and (limit_price or valuation_price).amount*quantity.amount<market.min_notional.amount:
+            raise ValueError('remaining position is below venue minimum; retained as visible dust')
+    return quantity
+
+
 @dataclass(frozen=True, slots=True)
 class VenueMarketSpecification:
     """Exact order constraints supplied by venue reference metadata."""
@@ -92,8 +119,10 @@ class MarketableLimitPolicy:
     protection_bps: int = 10
     price_decimals: int = 2
     market: VenueMarketSpecification | None = None
+    require_verified_metadata: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.require_verified_metadata) is not bool:raise TypeError('metadata requirement must be boolean')
         if isinstance(self.protection_bps, bool) or not isinstance(
             self.protection_bps, int
         ):
@@ -147,6 +176,7 @@ class MarketableLimitPolicy:
         """Return venue-stepped quantity and protected limit, or refuse."""
         if not isinstance(quantity, Quantity):
             raise TypeError("quantity must be a Quantity")
+        if self.require_verified_metadata and not self.metadata_valid_at(quote.as_of):raise ValueError('verified, unexpired venue metadata is required')
         limit = self.limit_price(side, quote)
         market = self.market
         if market is None:
@@ -161,7 +191,7 @@ class MarketableLimitPolicy:
         if stepped.is_zero:
             raise ValueError("quantity rounds to zero at the venue step")
         notional = limit.notional(stepped)
-        if notional < market.min_notional:
+        if limit.amount*stepped.amount < market.min_notional.amount:
             raise ValueError(
                 f"order notional {notional} is below venue minimum "
                 f"{market.min_notional}"
@@ -177,8 +207,27 @@ class MarketableLimitPolicy:
         """Whether time-bounded venue metadata still permits new orders."""
         if not isinstance(at, datetime) or at.tzinfo is None:
             raise TypeError("at must be a timezone-aware datetime")
+        if self.require_verified_metadata and (self.market is None or self.market.captured_at is None or self.market.valid_until is None
+                or self.market.metadata_source!='/trade/api/v2/tradeInfo' or at<self.market.captured_at):
+            return False
         return (
             self.market is None
             or self.market.valid_until is None
             or at <= self.market.valid_until
         )
+
+    def validate_order(self,intent,quote,at):
+        """Validate already-constructed orders without silently rounding them."""
+        if not self.metadata_valid_at(at):raise ValueError('verified venue metadata missing, unsupported or expired')
+        market=self.market
+        if market is None:return
+        if intent.symbol!=quote.symbol or intent.quantity.asset!=quote.symbol.split('/')[0]:
+            raise ValueError('order market or base asset mismatch')
+        if intent.limit_price is None:raise ValueError('real-market paper execution requires a protected limit')
+        if intent.limit_price.currency!=market.min_notional.currency:raise ValueError('order currency mismatch')
+        with decimal.localcontext(FINANCIAL_CONTEXT):
+            if intent.quantity.floor_to_step(market.quantity_step)!=intent.quantity:raise ValueError('order quantity violates venue increment')
+            quantum=Decimal(1).scaleb(-market.price_decimals)
+            if intent.limit_price.amount.quantize(quantum)!=intent.limit_price.amount:raise ValueError('order price violates venue precision')
+            notional=intent.quantity.amount*intent.limit_price.amount
+            if not market.min_notional.amount<=notional<=market.max_notional.amount:raise ValueError('order notional violates venue bounds')
