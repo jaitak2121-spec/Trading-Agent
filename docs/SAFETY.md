@@ -655,8 +655,9 @@ audit.verify()
 4. **Never add a second path to `place_order`.** A bypass is not an optimisation;
    it is the loss of every invariant in §2.
 5. **Never add a retry after an uncertain outcome.** See §2.
-6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 2,106
-   tests in ~2.5 s. There is no reason to run a subset.
+6. **Run the whole suite.** `python3 -m unittest discover -s tests -t .` — 2,209
+   tests pass with local socket/process permission. Restricted runs skip five
+   HTTP tests and one native memory-supervision test. Report all checks.
 7. **Run the application soak.** `python3 -m trading.app --soak-cycles 190`
    verifies repeated ingestion, reconciliation, strategy, execution, readiness,
    UNKNOWN absence, and the audit chain before transport/configuration changes.

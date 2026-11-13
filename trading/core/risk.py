@@ -79,6 +79,10 @@ class RiskLimit(Enum):
     ORDER_RATE = "max_orders_per_minute"
     OPEN_ORDERS = "max_open_orders"
     MARK_PRICE_AVAILABLE = "mark_price_available"
+    DRAWDOWN = 'max_drawdown_fraction'
+    POSITION_COUNT = 'max_positions'
+    COOLDOWN = 'trade_cooldown_seconds'
+    VOLATILITY = 'max_candle_range_fraction'
 
 
 #: The checks :class:`RiskEngine` runs, in evaluation order. An approval that
@@ -264,6 +268,7 @@ class PnlLedger:
         self._unattributed = 0
         self._lock = threading.RLock()
 
+
     @property
     def base_currency(self):
         return self._currency
@@ -414,6 +419,28 @@ class RiskEngine:
         self._pnl = pnl_ledger or PnlLedger(config.base_currency, clock=clock)
         self._submissions: deque[float] = deque()
         self._lock = threading.RLock()
+        peaks = [r.details['equity'] for r in audit.records() if r.action == 'risk.equity_peak']
+        self._equity_peak = None if not peaks else Money(peaks[-1], config.base_currency)
+        self._volatility = {}
+
+    def observe_equity(self, equity: Money) -> None:
+        if equity.currency != self.config.base_currency:
+            raise SafetyViolation('risk equity currency mismatch')
+        with self._lock:
+            if self._equity_peak is None or equity > self._equity_peak:
+                self._audit.record(AuditCategory.RISK, 'risk.equity_peak',
+                                   outcome=AuditOutcome.INFO, actor=self._identity.principal_id,
+                                   details={'equity': str(equity.amount)})
+                self._equity_peak = equity
+
+    def observe_candle(self, candle) -> None:
+        end = candle.open_time + dt.timedelta(seconds=candle.interval_seconds)
+        if end > self._clock.now():
+            raise SafetyViolation('cannot measure volatility from an incomplete candle')
+        with self._lock:
+            previous = self._volatility.get(candle.symbol)
+            if previous is None or end >= previous[0]:
+                self._volatility[candle.symbol] = (end, candle.range / candle.close.amount)
 
     @property
     def config(self) -> RiskConfig:
@@ -491,6 +518,7 @@ class RiskEngine:
         *,
         positions: Mapping[str, Quantity],
         mark_prices: Mapping[str, Price],
+        equity: Money | None = None,
     ) -> RiskApproval:
         """Run every check and mint an approval, or raise :class:`RiskLimitExceeded`.
 
@@ -708,6 +736,43 @@ class RiskEngine:
                         allowed=str(config.max_open_orders),
                     )
                 )
+
+            checked.extend((RiskLimit.DRAWDOWN, RiskLimit.POSITION_COUNT,
+                            RiskLimit.COOLDOWN, RiskLimit.VOLATILITY))
+            extra = []
+            if config.max_drawdown_fraction is not None:
+                if equity is None:
+                    extra.append((RiskLimit.DRAWDOWN, 'missing fresh equity', str(config.max_drawdown_fraction)))
+                else:
+                    self.observe_equity(equity)
+                    peak = self._equity_peak.amount
+                    drawdown = Decimal(1) if peak <= 0 else (peak - equity.amount) / peak
+                    if drawdown >= config.max_drawdown_fraction:
+                        extra.append((RiskLimit.DRAWDOWN, str(drawdown), str(config.max_drawdown_fraction)))
+            if config.max_positions is not None:
+                occupied = {s for s, q in positions.items() if not q.is_zero}
+                occupied.update(o.symbol for o in self._orders.open_orders())
+                occupied.add(symbol)
+                if len(occupied) > config.max_positions:
+                    extra.append((RiskLimit.POSITION_COUNT, str(len(occupied)), str(config.max_positions)))
+            if config.trade_cooldown_seconds:
+                for order in self._orders.all_orders():
+                    if order.symbol == symbol:
+                        age = (self._clock.now() - dt.datetime.fromisoformat(order.as_details()['updated_at'])).total_seconds()
+                        if age < config.trade_cooldown_seconds:
+                            extra.append((RiskLimit.COOLDOWN, str(age), str(config.trade_cooldown_seconds)))
+                            break
+            if config.max_candle_range_fraction is not None:
+                observation = self._volatility.get(symbol)
+                if observation is None or not 0 <= (self._clock.now() - observation[0]).total_seconds() <= 120:
+                    extra.append((RiskLimit.VOLATILITY, 'missing fresh closed candle', str(config.max_candle_range_fraction)))
+                elif observation[1] >= config.max_candle_range_fraction:
+                    extra.append((RiskLimit.VOLATILITY, str(observation[1]), str(config.max_candle_range_fraction)))
+            for limit, observed, allowed in extra:
+                if reduces_position:
+                    waived.append(limit)
+                else:
+                    breaches.append(LimitBreach(limit, 'runtime risk policy refused order', observed, allowed))
 
             if breaches:
                 self._refuse(intent, breaches, checked)

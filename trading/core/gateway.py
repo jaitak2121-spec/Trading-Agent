@@ -306,6 +306,12 @@ class ExecutionGateway:
             raise TypeError("submit() takes an OrderIntent")
 
         with self._lock:
+            guard = getattr(self, 'submission_guard', None)
+            if guard is not None:
+                try:
+                    guard()
+                except SafetyViolation as exc:
+                    return self._refuse(ExecutionGate.KILL_SWITCH, exc, intent)
             return self._submit_locked(intent, proposer, mark_prices or {})
 
     def _submit_locked(
@@ -373,10 +379,16 @@ class ExecutionGateway:
             # 8. Risk. The approval that comes back is a capability covering
             #    every limit; there is no way to reach step 9 without one.
             try:
+                prices = self._resolve_prices(intent, mark_prices)
+                equity = (
+                    self._positions.equity(prices)
+                    if self._config.risk.max_drawdown_fraction is not None else None
+                )
                 approval = self._risk.approve(
                     intent,
                     positions=self._positions.snapshot(),
-                    mark_prices=self._resolve_prices(intent, mark_prices),
+                    mark_prices=prices,
+                    equity=equity,
                 )
             except SafetyViolation as exc:
                 return self._refuse(
@@ -564,6 +576,17 @@ class ExecutionGateway:
         # cannot name. Recorded as such, so the limit refuses instead of
         # reading an understated loss (INVARIANT 7).
         self._risk.pnl.record(effect.realized_pnl, attributed=effect.realized_is_known)
+        self._audit.record(
+            AuditCategory.ORDER, 'portfolio.fill', outcome=AuditOutcome.INFO,
+            actor=self._identity.principal_id,
+            details={'order_id': order.order_id, **effect.as_details()},
+        )
+        if effect.position.is_flat:
+            self._audit.record(
+                AuditCategory.ORDER, 'paper.trade_closed', outcome=AuditOutcome.INFO,
+                actor=self._identity.principal_id,
+                details={'order_id': order.order_id, **effect.as_details()},
+            )
 
     def _apply_fetched_state(
         self,

@@ -157,8 +157,25 @@ class RiskConfig:
     max_orders_per_minute: int = 6
     max_open_orders: int = 5
     risk_fraction_per_trade: Decimal = field(default=Decimal("0.005"))
+    max_drawdown_fraction: Decimal | None = None
+    max_positions: int | None = None
+    trade_cooldown_seconds: int = 0
+    max_candle_range_fraction: Decimal | None = None
 
     def __post_init__(self) -> None:
+        for name in ('max_drawdown_fraction', 'max_candle_range_fraction'):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, Decimal) or not value.is_finite()
+                or not Decimal(0) < value <= Decimal(1)
+            ):
+                raise ConfigurationError(name + ' must be a Decimal in (0, 1]')
+        if self.max_positions is not None and (
+            type(self.max_positions) is not int or self.max_positions < 1
+        ):
+            raise ConfigurationError('max_positions must be a positive integer')
+        if type(self.trade_cooldown_seconds) is not int or self.trade_cooldown_seconds < 0:
+            raise ConfigurationError('trade_cooldown_seconds must be a nonnegative integer')
         for name in (
             "max_order_notional",
             "max_position_notional",
@@ -273,6 +290,10 @@ class TradingConfig:
             "max_orders_per_minute": self.risk.max_orders_per_minute,
             "max_open_orders": self.risk.max_open_orders,
             "risk_fraction_per_trade": str(self.risk.risk_fraction_per_trade),
+            'max_drawdown_fraction': None if self.risk.max_drawdown_fraction is None else str(self.risk.max_drawdown_fraction),
+            'max_positions': self.risk.max_positions,
+            'trade_cooldown_seconds': self.risk.trade_cooldown_seconds,
+            'max_candle_range_fraction': None if self.risk.max_candle_range_fraction is None else str(self.risk.max_candle_range_fraction),
             "api_key_fingerprint": self.api_key.fingerprint() if self.api_key else None,
             "api_secret_present": self.api_secret is not None,
             "kill_switch_path": self.kill_switch_path,
@@ -326,6 +347,14 @@ class TradingConfig:
             risk_fraction_per_trade=_parse_risk_fraction(
                 data.get("risk_fraction_per_trade", defaults.risk_fraction_per_trade)
             ),
+            max_drawdown_fraction=(None if data.get('max_drawdown_fraction') is None
+                                   else to_decimal(data['max_drawdown_fraction'])),
+            max_candle_range_fraction=(None if data.get('max_candle_range_fraction') is None
+                                       else to_decimal(data['max_candle_range_fraction'])),
+            max_positions=(None if data.get('max_positions') is None else
+                           _parse_int(data['max_positions'], name='max_positions', minimum=1)),
+            trade_cooldown_seconds=_parse_int(data.get('trade_cooldown_seconds', 0),
+                                             name='trade_cooldown_seconds'),
         )
 
         api_key = data.get("api_key")
@@ -441,6 +470,10 @@ _ALLOWED_KEYS: Final = frozenset(
         "max_orders_per_minute",
         "max_open_orders",
         "risk_fraction_per_trade",
+        'max_drawdown_fraction',
+        'max_candle_range_fraction',
+        'max_positions',
+        'trade_cooldown_seconds',
         "api_key",
         "api_secret",
         "kill_switch_path",

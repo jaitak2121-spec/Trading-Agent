@@ -13,3 +13,8 @@ max_daily_loss = "2000.00"
 max_orders_per_minute = 60
 max_open_orders = 5
 risk_fraction_per_trade = "0.001"
+# Runtime policies; fractions use exact decimal strings.
+max_drawdown_fraction = "0.10"
+max_positions = 5
+trade_cooldown_seconds = 60
+max_candle_range_fraction = "0.10"

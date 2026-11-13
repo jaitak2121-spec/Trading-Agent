@@ -1,0 +1,16 @@
+# Explicit conservative public-data / paper-only profile. No credentials.
+[trading]
+environment = "paper"
+live_trading = false
+base_currency = "USDT"
+max_order_notional = "1000.00"
+max_position_notional = "1000.00"
+max_gross_exposure = "1000.00"
+max_daily_loss = "100.00"
+max_orders_per_minute = 20
+max_open_orders = 1
+risk_fraction_per_trade = "0.001"
+max_drawdown_fraction = "0.10"
+max_positions = 1
+trade_cooldown_seconds = 60
+max_candle_range_fraction = "0.10"
