@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "operation": "experience_retraining",
+  "interval_seconds": 86400,
+  "timeout_seconds": 600,
+  "cpu_seconds": 540,
+  "memory_mb": 1024,
+  "state_db": "artifacts/paper.sqlite3",
+  "registry_db": "artifacts/model-registry.sqlite3",
+  "symbol": "BTC/USDT",
+  "exchange": "c2c1",
+  "minimum_candles": 720,
+  "minimum_new_candles": 1440,
+  "maximum_candles": 10080,
+  "output_directory": "artifacts/experience-learning"
+}

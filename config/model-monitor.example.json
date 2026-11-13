@@ -1,0 +1,8 @@
+{
+  "window": 500,
+  "minimum_samples": 100,
+  "mean_z_limit": 1.0,
+  "tail_fraction_limit": 0.1,
+  "max_brier_excess": 0.02,
+  "on_alert": "pause"
+}
