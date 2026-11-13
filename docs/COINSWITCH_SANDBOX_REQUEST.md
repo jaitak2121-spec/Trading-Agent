@@ -9,10 +9,16 @@ include API keys, private keys, OTPs, balances, or account screenshots.
 Hello CoinSwitch API Support,
 
 We are validating a safety-first Spot trading integration. It currently uses
-only the public market-data stream and an in-process paper broker; it does not
-send authenticated requests or real orders.
+the public market-data stream, authenticated GET-only historical candles and an
+in-process paper broker. It does not send exchange orders or modify account funds.
 
-Before implementing authenticated transport, please confirm in writing:
+Before implementing authenticated order transport, please confirm in writing:
+
+Your CSX onboarding documentation links `sandbox-csx.coinswitch.co`. Its public
+health route returns 403 from our environment. Please clarify onboarding/access,
+the supported API surface, and whether this environment can qualify the PRO
+Spot v2 `/trade/api/v2` contract or requires the separate CSX protocol. We have
+not sent existing production/historical credentials to that host.
 
 1. Whether CoinSwitch provides a non-production Spot sandbox or testnet.
 2. Its official REST and WebSocket base URLs.
