@@ -96,6 +96,7 @@ def run_restart_drill(
             failures.append("restart recovery or initial reconciliation failed")
         if second_app.stack.orders.unknown_orders():
             failures.append("UNKNOWN orders remained after restart recovery")
+        second_app.resume(reason='explicit restart qualification continuation')
         second = run_soak(second_app, cycles=cycles_per_run)
         second_app.stack.audit.verify()
     finally:

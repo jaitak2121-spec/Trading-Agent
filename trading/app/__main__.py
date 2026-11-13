@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
+import os
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -31,6 +33,7 @@ from ..strategy import MovingAverageCrossover
 from .composition import build_paper_stack
 from ..core.config import RiskConfig, TradingConfig
 from ..core.errors import ConfigurationError
+from ..core.secrets import Secret
 from .paper_session import MarketFrame, PaperTradingSession, SymbolBar
 from .runtime import build_coinswitch_paper_application, build_demo_paper_application
 from .soak import run_soak, run_timed_soak
@@ -46,11 +49,27 @@ from ..adapters.observation_evidence import (
 from ..adapters.soak_evidence import write_soak_evidence
 from .coinswitch_observation import run_coinswitch_observation
 from .model_training import (
+    diagnose_direction_model_robustness,
     evaluate_direction_model,
     split_direction_datasets,
     train_direction_model,
+    train_validated_direction_model,
 )
 from .model_strategy import PaperDirectionModelStrategy
+from .strategy_research import load_dashboard_summary
+from ..adapters.coinswitch.historical_candles import (
+    CoinSwitchCandleTransport,
+    CoinSwitchCandleTransportError,
+)
+from .historical_candles import (
+    HistoricalCandleError,
+    download_historical_candles,
+    validate_candle_dataset,
+)
+from .segmented_datasets import (
+    finalize_segment_manifest,
+    prepare_segmented_datasets,
+)
 
 _SYMBOL = "DEMO"
 _ASSET = "DEMO"
@@ -117,13 +136,13 @@ def _demo_risk() -> RiskConfig:
 def _serve_application(application, *, description: str) -> int:
     """Run until SIGINT/SIGTERM, then close every owned component cleanly."""
     with GracefulShutdown() as shutdown:
-        application.start()
-        print(
-            f"paper application running at {application.server.url} "
-            f"({description}, live trading off)"
-        )
-        print("Press Ctrl-C to stop.")
         try:
+            application.start()
+            print(
+                f"paper application running at {application.server.url} "
+                f"({description}, live trading off)"
+            )
+            print("Press Ctrl-C to stop.")
             shutdown.wait()
         finally:
             reason = shutdown.reason or "shutdown requested"
@@ -135,6 +154,7 @@ def _serve_application(application, *, description: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m trading.app",
+        allow_abbrev=False,
         description="Run a deterministic paper session or continuous local dashboard.",
     )
     parser.add_argument(
@@ -151,6 +171,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=0,
         help="paper fill slippage in basis points against the order (default: 0)",
     )
+    parser.add_argument('--fee-bps', type=int, default=0,
+                        help='paper fee per fill in basis points (0 means no fee)')
+    parser.add_argument('--resume-paper', action='store_true',
+                        help='explicitly resume a recovered paper bot')
+    parser.add_argument('--model-registry-db', help='approval registry required for ML paper deployment')
+    parser.add_argument('--paper-controls', action='store_true', help='enable authenticated local paper bot controls')
+    parser.add_argument('--research-report', help='explicit development comparison, native walk-forward or frozen-fill cost report for dashboard')
+    parser.add_argument('--model-monitor-policy', help='explicit operational monitoring limits for an approved model')
+    parser.add_argument('--learning-reports', help='explicit experience-learning report directory for read-only dashboard status')
+    parser.add_argument('--local-notifications', action='store_true', help='opt in to macOS desktop failure notifications')
     parser.add_argument(
         "--state-db",
         default=None,
@@ -213,10 +243,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="evaluate a frozen model on a distinct candle dataset",
     )
     mode.add_argument(
+        "--diagnose-model",
+        metavar="MODEL",
+        default=None,
+        help="evaluate a frozen model on approved segments 3, 5 and 6",
+    )
+    mode.add_argument(
         "--split-model-data",
         metavar="CANDLE_DATASET",
         default=None,
         help="split at least 240 candles into non-overlapping model datasets",
+    )
+    mode.add_argument(
+        "--prepare-segmented-model-data",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="derive the approved gap-safe ML segments without training",
+    )
+    mode.add_argument(
+        "--download-coinswitch-candles",
+        metavar="BASE/QUOTE",
+        default=None,
+        help="download authenticated, read-only historical CoinSwitch Spot candles",
+    )
+    mode.add_argument(
+        "--validate-candle-data",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="validate ordering, duplicates, gaps, OHLCV and dataset integrity",
     )
     parser.add_argument(
         "--host",
@@ -334,6 +388,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="atomic JSON output required by --train-model",
     )
     parser.add_argument(
+        "--validation-data",
+        metavar="CANDLE_DATASET",
+        default=None,
+        help="validated segment 3 required for real segmented model training",
+    )
+    parser.add_argument(
+        "--validation-output",
+        metavar="PATH",
+        default=None,
+        help="atomic validation evidence output paired with --validation-data",
+    )
+    parser.add_argument(
+        "--historical-start-ms",
+        type=int,
+        default=None,
+        help="inclusive interval-aligned Unix-ms start for historical candles",
+    )
+    parser.add_argument(
+        "--historical-end-ms",
+        type=int,
+        default=None,
+        help="exclusive interval-aligned Unix-ms end for historical candles",
+    )
+    parser.add_argument(
+        "--historical-interval-minutes",
+        type=int,
+        default=None,
+        help="historical candle interval in minutes (default: 1)",
+    )
+    parser.add_argument(
+        "--historical-chunk-candles",
+        type=int,
+        default=None,
+        help="maximum candles requested per REST call (default: 1440)",
+    )
+    parser.add_argument(
+        "--historical-output",
+        metavar="PATH",
+        default=None,
+        help="atomic dataset output required by --download-coinswitch-candles",
+    )
+    parser.add_argument(
         "--evaluation-data",
         metavar="CANDLE_DATASET",
         default=None,
@@ -346,6 +442,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="atomic evidence output required by --evaluate-model",
     )
     parser.add_argument(
+        "--segment-manifest",
+        metavar="PATH",
+        default=None,
+        help="validated segment manifest required by --diagnose-model",
+    )
+    parser.add_argument(
+        "--diagnostic-output",
+        metavar="PATH",
+        default=None,
+        help="atomic robustness evidence output required by --diagnose-model",
+    )
+    parser.add_argument(
         "--training-data-output",
         metavar="PATH",
         default=None,
@@ -356,6 +464,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="PATH",
         default=None,
         help="evaluation half required by --split-model-data",
+    )
+    parser.add_argument(
+        "--segment-output-dir",
+        metavar="DIRECTORY",
+        default=None,
+        help="artifact directory required by --prepare-segmented-model-data",
     )
     parser.add_argument(
         "--paper-model",
@@ -400,6 +514,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--train-model requires --model-output")
     if args.model_output is not None and args.train_model is None:
         parser.error("--model-output requires --train-model")
+    validation_options = (args.validation_data, args.validation_output)
+    if any(value is not None for value in validation_options) and not all(
+        value is not None for value in validation_options
+    ):
+        parser.error("--validation-data and --validation-output must be supplied together")
+    if any(value is not None for value in validation_options) and args.train_model is None:
+        parser.error("validation training options require --train-model")
+    historical_values = (
+        args.historical_start_ms,
+        args.historical_end_ms,
+        args.historical_interval_minutes,
+        args.historical_chunk_candles,
+        args.historical_output,
+    )
+    required_historical_values = (
+        args.historical_start_ms,
+        args.historical_end_ms,
+        args.historical_output,
+    )
+    if args.download_coinswitch_candles is not None and not all(
+        value is not None for value in required_historical_values
+    ):
+        parser.error(
+            "--download-coinswitch-candles requires --historical-start-ms, "
+            "--historical-end-ms, and --historical-output"
+        )
+    if args.download_coinswitch_candles is None and any(
+        value is not None for value in historical_values
+    ):
+        parser.error("historical range/output options require --download-coinswitch-candles")
     if args.evaluate_model is not None and (
         args.evaluation_data is None or args.evaluation_output is None
     ):
@@ -410,6 +554,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.evaluation_data is not None or args.evaluation_output is not None
     ):
         parser.error("evaluation options require --evaluate-model")
+    diagnostic_options = (args.segment_manifest, args.diagnostic_output)
+    if args.diagnose_model is not None and not all(diagnostic_options):
+        parser.error(
+            "--diagnose-model requires --segment-manifest and --diagnostic-output"
+        )
+    if args.diagnose_model is None and any(diagnostic_options):
+        parser.error("diagnostic options require --diagnose-model")
     split_outputs = (args.training_data_output, args.evaluation_data_output)
     if args.split_model_data is not None and not all(split_outputs):
         parser.error(
@@ -418,6 +569,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.split_model_data is None and any(split_outputs):
         parser.error("model-data output options require --split-model-data")
+    if (
+        args.prepare_segmented_model_data is not None
+        and args.segment_output_dir is None
+    ):
+        parser.error("--prepare-segmented-model-data requires --segment-output-dir")
+    if (
+        args.prepare_segmented_model_data is None
+        and args.segment_output_dir is not None
+    ):
+        parser.error("--segment-output-dir requires --prepare-segmented-model-data")
     paper_model_options = (
         args.paper_model,
         args.paper_model_evaluation,
@@ -432,6 +593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.paper_model is not None and args.coinswitch_symbol is None:
         parser.error("--paper-model requires --coinswitch-symbol")
+    if args.paper_model is not None and args.model_registry_db is None:
+        parser.error('--paper-model requires --model-registry-db with explicit paper approval')
     if args.paper_model is not None and args.coinswitch_observe_seconds is not None:
         parser.error("--paper-model cannot be used in observation-only mode")
 
@@ -454,20 +617,146 @@ def main(argv: Sequence[str] | None = None) -> int:
             and args.train_model is None
             and args.evaluate_model is None
             and args.split_model_data is None
+            and args.prepare_segmented_model_data is None
+            and args.download_coinswitch_candles is None
+            and args.validate_candle_data is None
             and profile.risk.base_currency != USD
         ):
             parser.error(
                 "synthetic paper modes require a USD configuration profile"
             )
 
+    if args.validate_candle_data is not None:
+        try:
+            dataset = json.loads(
+                Path(args.validate_candle_data).read_text(encoding="utf-8")
+            )
+            report = validate_candle_dataset(dataset, minimum_candles=240)
+        except (
+            HistoricalCandleError,
+            CoinSwitchCandleTransportError,
+            OSError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            parser.error(f"candle dataset validation failed: {exc}")
+        print(report.render())
+        return 0 if report.passed else 2
+
+    if args.download_coinswitch_candles is not None:
+        api_key = os.environ.get("COINSWITCH_API_KEY")
+        api_secret = os.environ.get("COINSWITCH_API_SECRET")
+        if not api_key or not api_secret:
+            parser.error(
+                "historical download requires COINSWITCH_API_KEY and "
+                "COINSWITCH_API_SECRET environment variables"
+            )
+        symbol = args.download_coinswitch_candles.strip().upper()
+        try:
+            quote_code = symbol.rsplit("/", 1)[1]
+            exchange = args.coinswitch_exchange or (
+                "coinswitchx" if quote_code == "INR" else "c2c1"
+            )
+            transport = CoinSwitchCandleTransport(
+                api_key=Secret(api_key, label="coinswitch_api_key"),
+                api_secret=Secret(api_secret, label="coinswitch_api_secret"),
+            )
+            dataset, report = download_historical_candles(
+                fetch=transport.fetch,
+                exchange=exchange,
+                symbol=symbol,
+                interval_minutes=args.historical_interval_minutes or 1,
+                start_time_ms=args.historical_start_ms,
+                end_time_ms=args.historical_end_ms,
+                chunk_candles=args.historical_chunk_candles or 1440,
+            )
+            write_json_atomically(args.historical_output, dataset)
+        except (
+            HistoricalCandleError,
+            CoinSwitchCandleTransportError,
+            IndexError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            parser.error(f"historical candle download failed: {exc}")
+        print(report.render())
+        print(f"dataset           : {args.historical_output}")
+        return 0 if report.passed else 2
+
     if args.train_model is not None:
         try:
             dataset = json.loads(Path(args.train_model).read_text(encoding="utf-8"))
-            report = train_direction_model(dataset)
-            write_json_atomically(args.model_output, report.model)
+            if args.validation_data is None:
+                report = train_direction_model(dataset)
+                validation_report = None
+            else:
+                validation_dataset = json.loads(
+                    Path(args.validation_data).read_text(encoding="utf-8")
+                )
+                report, validation_report = train_validated_direction_model(
+                    dataset, validation_dataset
+                )
+            model_path = write_json_atomically(args.model_output, report.model)
+            if validation_report is not None:
+                evidence = dict(validation_report.evidence)
+                evidence["model_artifact_sha256"] = hashlib.sha256(
+                    model_path.read_bytes()
+                ).hexdigest()
+                write_json_atomically(args.validation_output, evidence)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             parser.error(f"model training failed: {exc}")
         print(report.render())
+        if validation_report is not None:
+            print()
+            print(validation_report.render())
+            print(f"validation evidence: {args.validation_output}")
+        return 0
+
+    if args.prepare_segmented_model_data is not None:
+        try:
+            source_path = Path(args.prepare_segmented_model_data)
+            source_bytes = source_path.read_bytes()
+            source = json.loads(source_bytes)
+            outputs, manifest = prepare_segmented_datasets(
+                source,
+                source_file_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            )
+            directory = Path(args.segment_output_dir)
+            names = {
+                "training": "training-segment-1.json",
+                "validation": "validation-segment-3.json",
+                "robustness_5": "robustness-segment-5.json",
+                "robustness_6": "robustness-segment-6.json",
+                "test": "final-test-segment-7.json",
+            }
+            artifact_records = {}
+            for key, output in outputs.items():
+                path = write_json_atomically(directory / names[key], output)
+                metadata = output["ml_segment"]
+                artifact_records[key] = {
+                    "path": path.name,
+                    "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "derivation_sha256": metadata["derivation_sha256"],
+                    "candle_count": metadata["candle_count"],
+                    "sample_count": metadata["sample_count"],
+                    "validation_passed": True,
+                }
+            manifest["artifacts"] = artifact_records
+            manifest = finalize_segment_manifest(manifest)
+            manifest_path = write_json_atomically(directory / "manifest.json", manifest)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(f"segmented model-data preparation failed: {exc}")
+        print("segmented model data: COMPLETE")
+        for key in ("training", "validation", "robustness_5", "robustness_6", "test"):
+            record = artifact_records[key]
+            print(
+                f"{key:12}: {record['candle_count']} candles, "
+                f"{record['sample_count']} samples"
+            )
+        print(f"manifest    : {manifest_path}")
+        print("training    : not performed")
         return 0
 
     if args.split_model_data is not None:
@@ -496,6 +785,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             parser.error(f"model evaluation failed: {exc}")
         print(report.render())
+        return 0
+
+    if args.diagnose_model is not None:
+        try:
+            model_path = Path(args.diagnose_model)
+            model_bytes = model_path.read_bytes()
+            model = json.loads(model_bytes)
+            manifest_path = Path(args.segment_manifest)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            records = manifest.get("artifacts")
+            if not isinstance(records, dict):
+                raise ValueError("segment manifest artifacts are missing")
+            datasets = {}
+            for key in ("training", "validation", "robustness_5", "robustness_6"):
+                record = records.get(key)
+                if not isinstance(record, dict):
+                    raise ValueError(f"segment manifest {key} artifact is missing")
+                relative_path = record.get("path")
+                expected_hash = record.get("file_sha256")
+                if (
+                    not isinstance(relative_path, str)
+                    or Path(relative_path).is_absolute()
+                    or Path(relative_path).name != relative_path
+                    or not isinstance(expected_hash, str)
+                ):
+                    raise ValueError(f"segment manifest {key} artifact is invalid")
+                artifact_bytes = (manifest_path.parent / relative_path).read_bytes()
+                if hashlib.sha256(artifact_bytes).hexdigest() != expected_hash:
+                    raise ValueError(f"segment manifest {key} file hash mismatch")
+                datasets[key] = json.loads(artifact_bytes)
+            evidence = diagnose_direction_model_robustness(
+                model,
+                datasets["training"],
+                datasets["validation"],
+                datasets["robustness_5"],
+                datasets["robustness_6"],
+            )
+            evidence["model_artifact_sha256"] = hashlib.sha256(model_bytes).hexdigest()
+            write_json_atomically(args.diagnostic_output, evidence)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(f"model robustness diagnosis failed: {exc}")
+        print("frozen-model robustness diagnosis: COMPLETE")
+        print("evaluated segments: 3, 5, 6")
+        print("final test      : untouched")
+        print(f"evidence        : {args.diagnostic_output}")
         return 0
 
     if args.coinswitch_symbol is not None:
@@ -554,11 +888,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluation = json.loads(
                     Path(args.paper_model_evaluation).read_text(encoding="utf-8")
                 )
+                from .model_registry import require_registry_approval
+                approval_check = lambda: require_registry_approval(
+                    args.model_registry_db, model, args.paper_model, args.paper_model_evaluation
+                )
+                approval_check()
                 paper_strategy = PaperDirectionModelStrategy(
                     model=model,
                     evaluation=evaluation,
                     confirmation=args.confirm_paper_model,
                     symbol=args.coinswitch_symbol,
+                    approval_check=approval_check,
+                    exchange=selected_exchange,
                 )
             market_info_body = (
                 Path(args.coinswitch_market_info_file).read_bytes()
@@ -570,6 +911,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exchange=selected_exchange,
                 starting_cash=cash,
                 slippage_bps=args.slippage_bps,
+                fee_bps=args.fee_bps,
+                paper_controls=args.paper_controls,
+                research_summary=None if args.research_report is None else load_dashboard_summary(args.research_report),
+                model_monitor_policy=None if args.model_monitor_policy is None else json.loads(Path(args.model_monitor_policy).read_text()),
+                learning_reports=args.learning_reports,
+                local_notifications=args.local_notifications,
                 sqlite_path=args.state_db,
                 poll_interval_seconds=args.poll_interval,
                 host=args.host,
@@ -586,6 +933,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             parser.error(f"invalid CoinSwitch paper configuration: {exc}")
+        if args.resume_paper:
+            application.resume(reason='explicit --resume-paper startup request')
         return _serve_application(
             application,
             description=(
@@ -599,6 +948,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         application = build_demo_paper_application(
             starting_cash=Money(args.cash, USD),
             slippage_bps=args.slippage_bps,
+            fee_bps=args.fee_bps,
             sqlite_path=args.state_db,
             poll_interval_seconds=args.poll_interval,
             host=args.host,
@@ -626,6 +976,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         application = build_demo_paper_application(
             starting_cash=Money(args.cash, USD),
             slippage_bps=args.slippage_bps,
+            fee_bps=args.fee_bps,
             sqlite_path=args.state_db,
             poll_interval_seconds=args.poll_interval,
             host=args.host,
@@ -655,14 +1006,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.dashboard:
         application = build_demo_paper_application(
+            local_notifications=args.local_notifications,
+            paper_controls=args.paper_controls,
+            research_summary=None if args.research_report is None else load_dashboard_summary(args.research_report),
             starting_cash=Money(args.cash, USD),
             slippage_bps=args.slippage_bps,
+            fee_bps=args.fee_bps,
             sqlite_path=args.state_db,
             poll_interval_seconds=args.poll_interval,
             host=args.host,
             port=args.port,
             risk=None if profile is None else profile.risk,
         )
+        if args.resume_paper:
+            application.resume(reason='explicit --resume-paper startup request')
         return _serve_application(
             application,
             description="synthetic data",
@@ -696,6 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         starting_cash=Money(args.cash, USD),
         risk=_demo_risk() if profile is None else profile.risk,
         slippage_bps=args.slippage_bps,
+        fee_bps=args.fee_bps,
         sqlite_path=args.state_db,
     )
     strategy = MovingAverageCrossover(fast=3, slow=5, atr_period=3, symbols=[_SYMBOL])

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.request
 import venv
 import zipfile
@@ -31,6 +34,13 @@ def free_loopback_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def require_startup_ready(port: int, pid: int) -> None:
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/readyz', timeout=.5) as response:
+        value = json.load(response)
+    if value.get('ready') is not True or value.get('pid') != pid:
+        raise RuntimeError('installed dashboard readiness belongs to another process')
 
 
 def start_health_stop(
@@ -61,6 +71,7 @@ def start_health_stop(
                         and last_snapshot["supervisor"]["passes"] >= min_passes
                         and not last_snapshot["portfolio"]["positions"]
                     ):
+                        require_startup_ready(port, process.pid)
                         break
                     time.sleep(0.05)
             except Exception:
@@ -118,6 +129,7 @@ def start_snapshot_condition_stop(
                 ) as response:
                     last_snapshot = json.loads(response.read())
                     if condition(last_snapshot):
+                        require_startup_ready(port, process.pid)
                         break
                     time.sleep(0.05)
             except Exception:
@@ -156,7 +168,7 @@ def install_isolated(wheel: Path, environment: Path) -> tuple[Path, Path]:
         console = binary / (
             "trading-paper.exe" if os.name == "nt" else "trading-paper"
         )
-        run([str(python), "-m", "pip", "install", "--no-deps", str(wheel)])
+        run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)])
         return python, console
     except subprocess.CalledProcessError:
         binary = environment / ("Scripts" if os.name == "nt" else "bin")
@@ -175,14 +187,15 @@ def install_isolated(wheel: Path, environment: Path) -> tuple[Path, Path]:
             )
         else:
             console = binary / "trading-paper"
-            console.write_text(
-                f"#!{python}\nimport sys\n"
-                f"sys.path.insert(0, {str(site_packages)!r})\n"
-                "from trading.app.__main__ import main\n"
-                "raise SystemExit(main())\n",
-                encoding="utf-8",
-            )
+            code=(f'import sys;sys.path.insert(0, {str(site_packages)!r});'
+                  'from trading.app.__main__ import main;raise SystemExit(main())')
+            console.write_text('#!/bin/sh\nexec '+shlex.quote(str(python))+' -c '
+                               +shlex.quote(code)+' "$@"\n',encoding='utf-8')
             console.chmod(0o755)
+        account_console = binary / ('trading-paper-account.cmd' if os.name == 'nt' else 'trading-paper-account')
+        account_console.write_text(console.read_text().replace('trading.app.__main__', 'trading.app.paper_account')
+                                   .replace('-m trading.app ', '-m trading.app.paper_account '),encoding='utf-8')
+        account_console.chmod(0o755)
         return python, console
 
 
@@ -190,10 +203,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--dist", default=str(ROOT / "dist"))
+    parser.add_argument('--evidence',help='new JSON path for installed-wheel verification results')
     args = parser.parse_args()
+    if args.evidence and Path(args.evidence).exists():
+        parser.error('release evidence already exists; choose a new path')
 
     dist = Path(args.dist).resolve()
     dist.mkdir(parents=True, exist_ok=True)
+    # Fixed wheel ZIP timestamps; callers may choose another recorded epoch.
+    build_env = dict(os.environ)
+    build_env.setdefault('SOURCE_DATE_EPOCH', '1794528000')
     run(
         [
             args.python,
@@ -202,15 +221,16 @@ def main() -> int:
             "wheel",
             str(ROOT),
             "--no-deps",
+            "--no-index",
             "--no-build-isolation",
             "--wheel-dir",
             str(dist),
-        ]
+        ], env=build_env
     )
-    wheels = sorted(dist.glob("safety_first_trading_app-*.whl"), key=lambda p: p.stat().st_mtime)
-    if not wheels:
+    version = tomllib.loads((ROOT/'pyproject.toml').read_text())['project']['version']
+    wheel = dist/f'safety_first_trading_app-{version}-py3-none-any.whl'
+    if not wheel.is_file():
         raise RuntimeError("wheel build produced no release artifact")
-    wheel = wheels[-1]
     artifact = verify_release_wheel(wheel)
     if not artifact.passed:
         raise RuntimeError("release artifact verification failed: " + "; ".join(artifact.failures))
@@ -219,10 +239,24 @@ def main() -> int:
         root = Path(directory)
         environment = root / "venv"
         python, console = install_isolated(wheel, environment)
-        run([str(console), "--help"], stdout=subprocess.DEVNULL)
-
         env = dict(os.environ)
+        env.pop('PYTHONPATH',None)
+        env.pop('PYTHONHOME',None)
         env["PYTHONUNBUFFERED"] = "1"
+        run([str(console), "--help"],stdout=subprocess.DEVNULL,env=env,cwd=root)
+        account_console=console.with_name('trading-paper-account'+console.suffix)
+        account_path=root/'custom-account.sqlite3'
+        created=run([str(account_console),'create','--state-db',str(account_path),
+            '--cash','1234.56','--currency','USD'],capture_output=True,env=env,cwd=root)
+        account=json.loads(created.stdout)
+        if account['state']!='paused' or account['starting_cash']!='1234.56' or account['live_trading']:
+            raise RuntimeError('installed account setup returned an invalid account')
+        port=free_loopback_port()
+        start_snapshot_condition_stop([str(console),'--dashboard','--port',str(port),
+            '--state-db',str(account_path)],port=port,env=env,
+            description='custom balance and paused new paper account',
+            condition=lambda s: s['application']['bot_state']=='paused'
+                and s['portfolio']['cash']=='1234.56' and not s['orders'])
         port = free_loopback_port()
         start_health_stop(
             [
@@ -260,24 +294,16 @@ def main() -> int:
             dashboard_command + ["--port", str(port)],
             port=port,
             env=env,
-            description="the expected restart reconciliation block",
-            condition=lambda snapshot: "position_mismatch"
-            in snapshot["operations"]["blocked_reasons"],
-        )
-        run(
-            [
-                str(console),
-                "--recover-paper-position",
-                str(interrupted),
-                "--confirm-paper-position-reset",
-                "I_ACCEPT_PAPER_VENUE_POSITION_RESET",
-                "--paper-recovery-reason",
-                "installed release drill intentionally interrupted an open position",
-            ]
+            description="restored inventory and paused bot",
+            condition=lambda snapshot: (
+                snapshot['application']['bot_state'] == 'paused'
+                and bool(snapshot['portfolio']['positions'])
+                and 'position_mismatch' not in snapshot['operations']['blocked_reasons']
+            ),
         )
         port = free_loopback_port()
         start_health_stop(
-            dashboard_command + ["--port", str(port)],
+            dashboard_command + ["--port", str(port), '--resume-paper'],
             port=port,
             env=env,
         )
@@ -291,6 +317,15 @@ def main() -> int:
             ]
         )
 
+    if args.evidence:
+        with Path(args.evidence).open('x') as output:
+            json.dump({'schema':'installed-paper-release/v1','artifact':asdict(artifact),
+                'passed':True,'checks':['installed CLI help','paused custom account and preserved balance',
+                    'HTTP dashboard health','crash inventory recovery','explicit resume',
+                    'clean shutdown','restart drill','owned-process startup readiness'],
+                'source_date_epoch':build_env['SOURCE_DATE_EPOCH'],'live_trading':False,
+                'real_orders':False,'fixtures':'temporary synthetic paper sessions'},output,indent=2)
+            output.write('\n')
     print(f"release drill: PASS\nwheel: {wheel}\nsha256: {artifact.sha256}")
     return 0
 

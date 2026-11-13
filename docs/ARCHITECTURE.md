@@ -533,8 +533,11 @@ source and tests.
 python3 -m unittest discover -s tests -t .
 ```
 
-2,106 tests pass in the current working tree. Current stdlib-`trace` coverage is
-95.2% (10,807 executable statements, 522 missed).
+2,209 tests pass in Python 3.11 and 3.13 with local process/socket permission and
+no skips. Five HTTP tests and the native child-memory supervision test skip in
+the restricted sandbox. The prior stdlib-`trace` coverage reading
+was 95.2% (10,807 executable statements, 522 missed); it has not been recomputed
+for the latest research and dashboard additions.
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -542,7 +545,7 @@ python3 -m unittest discover -s tests -t .
 | `test_app_release.py` | 3 | Wheel metadata/checksum/dependency verification and deterministic SQLite stop/rebuild/recovery continuity |
 | `test_app_runtime.py` | 5 | Coordinated synthetic quote/bar streaming, continuous application composition, supervised cycles, complete entry/exit execution, and shutdown ownership |
 | `test_app_supervisor.py` | 5 | Immediate scheduling, duplicate-worker refusal, clean/idempotent shutdown, configuration validation, and redacted fail-visible worker errors |
-| `test_app_dashboard.py` | 11 | Transaction-consistent JSON-safe operator snapshots, metadata-expiry readiness, transition alerts, audit limiting, loopback-only binding, read-only HTTP routes, health response, security headers, and mutation refusal |
+| `test_app_dashboard.py` | 12 | Transaction-consistent JSON-safe operator snapshots, mark-to-market equity/P&L and session drawdown, risk/ML state, metadata-expiry readiness, transition alerts, audit limiting, loopback-only binding, read-only HTTP routes, health response, security headers, and mutation refusal |
 | `test_app_soak.py` | 7 | Repeatable and wall-clock-paced whole-application soak verification, atomic checksum evidence, flat-end qualification, entry/exit and audit proof, operational-block failure, validation, and CLI exit behavior |
 | `test_coinswitch_observation.py` | 6 | Finite public-data qualification, quote/candle proof, recovered and terminal feed failure handling, atomic credential-free evidence and training datasets, and CLI validation |
 | `test_model_training.py` | 8 | Safe chronological dataset splitting, offline fitting, distinct out-of-sample evaluation, dataset/model hash binding, exact paper-trial approval, explained paper-only inference, baseline comparison, unsafe/short/gapped dataset refusal, and atomic CLI evidence |

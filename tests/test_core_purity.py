@@ -391,6 +391,12 @@ class TestAdaptersRespectTheArrow(PurityCase):
         for path in files_in(ADAPTERS):
             for imported in imports_of(path):
                 with self.subTest(path=path.name, imported=imported):
+                    if (
+                        path.relative_to(REPO_ROOT).as_posix()
+                        == "trading/adapters/coinswitch/historical_candles.py"
+                        and top_level(imported) == "cryptography"
+                    ):
+                        continue
                     self.assertImportAllowed(path, imported, LAYER_RULES[ADAPTERS])
 
     def test_no_adapter_imports_a_strategy(self) -> None:
@@ -502,6 +508,12 @@ class TestNoThirdPartyAnywhere(PurityCase):
             for imported in imports_of(path):
                 root = top_level(imported)
                 with self.subTest(path=path.name, imported=imported):
+                    if (
+                        path.relative_to(REPO_ROOT).as_posix()
+                        == "trading/adapters/coinswitch/historical_candles.py"
+                        and root == "cryptography"
+                    ):
+                        continue
                     self.assertTrue(
                         root == "trading" or root in sys.stdlib_module_names,
                         f"{path.relative_to(REPO_ROOT)} imports third-party "
@@ -546,9 +558,10 @@ class TestNoThirdPartyAnywhere(PurityCase):
 class TestNoInfrastructureModules(PurityCase):
     """Infrastructure stays at its one reviewed adapter boundary.
 
-    SQLite and the read-only operator HTTP server are deliberate infrastructure
-    implementations. Their imports are allowed only at their reviewed adapter
-    boundaries; database/network imports remain banned everywhere else.
+    SQLite, the read-only operator server, and read-only CoinSwitch market-data
+    clients are deliberate infrastructure implementations. Their imports are
+    allowed only at reviewed adapter boundaries; infrastructure remains banned
+    everywhere else.
     """
 
     def test_no_module_in_the_package_imports_infrastructure(self) -> None:
@@ -576,8 +589,14 @@ class TestNoInfrastructureModules(PurityCase):
                         continue
                     if (
                         path.relative_to(REPO_ROOT).as_posix()
+                        == "trading/adapters/coinswitch/historical_candles.py"
+                        and root in {"http", "urllib"}
+                    ):
+                        continue
+                    if (
+                        path.relative_to(REPO_ROOT).as_posix()
                         == "trading/adapters/process.py"
-                        and root == "signal"
+                        and root in {"signal", "subprocess"}
                     ):
                         continue
                     self.assertNotIn(
