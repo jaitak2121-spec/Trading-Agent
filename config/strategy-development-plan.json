@@ -1,0 +1,42 @@
+{
+  "schema": "fixed-strategy-development-plan/v1",
+  "source_file_sha256": "2c36a429413621ca33788fd627999658c9afccc98c4f184b994c05d9cbd5a871",
+  "chronology": {
+    "development_start_ms": 1783223040000,
+    "development_end_ms": 1788407040000,
+    "sealed_test_start_ms": 1788407040000,
+    "sealed_test_end_ms": 1788493440000
+  },
+  "folds": [
+    {
+      "fold_id": "development-1",
+      "train_start_ms": 1783223040000,
+      "train_end_ms": 1783827840000,
+      "validation_start_ms": 1783827840000,
+      "validation_end_ms": 1784432640000
+    },
+    {
+      "fold_id": "development-2",
+      "train_start_ms": 1783223040000,
+      "train_end_ms": 1784432640000,
+      "validation_start_ms": 1784432640000,
+      "validation_end_ms": 1785037440000
+    },
+    {
+      "fold_id": "development-3",
+      "train_start_ms": 1783223040000,
+      "train_end_ms": 1785037440000,
+      "validation_start_ms": 1785037440000,
+      "validation_end_ms": 1785642240000
+    }
+  ],
+  "candidates": [
+    "ma-crossover",
+    "momentum",
+    "mean-reversion",
+    "volatility-filtered-momentum"
+  ],
+  "scope": "development_only",
+  "selection": "none; compare fixed baselines only; no optimization or approval",
+  "future_period": "excluded placeholder; no final-test data is loaded or allocated"
+}

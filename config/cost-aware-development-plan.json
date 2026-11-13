@@ -1,0 +1,184 @@
+{
+  "acceptance": {
+    "max_drawdown_each_period": ".10",
+    "minimum_periods": 5,
+    "minimum_positive_base_periods": 4,
+    "minimum_trades_each_cost": 30,
+    "positive_mean_base_excess_over_full_hold": true,
+    "positive_mean_return_both_costs": true,
+    "positive_selection_adjusted_trade_pnl_interval_both_costs": true
+  },
+  "candidates": [
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 5,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "breakout",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    },
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 15,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "breakout",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    },
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 30,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "breakout",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    },
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 5,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "trend-pullback",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    },
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 15,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "trend-pullback",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    },
+    {
+      "aggregation": "complete UTC buckets; no filling",
+      "atr_period": 14,
+      "breakout_bars": 20,
+      "cost_gate": "2 ATR must cover twice the fixed base 26bp round-trip assumption",
+      "decision_minutes": 30,
+      "execution_minutes": 1,
+      "exit_channel_bars": 10,
+      "minimum_stop_fraction": "0.0052",
+      "pullback_bars": 20,
+      "pullback_target_atr_multiple": "4",
+      "rule": "trend-pullback",
+      "stop_atr_multiple": "2",
+      "trend_bars": 50
+    }
+  ],
+  "confirmation_accessed": false,
+  "costs_bps": {
+    "base": {
+      "fee": "10",
+      "slippage": "2",
+      "spread": "2"
+    },
+    "stress": {
+      "fee": "20",
+      "slippage": "5",
+      "spread": "4"
+    }
+  },
+  "implementation_sha256": {
+    "trading/app/backtest.py": "dd8eeeeacf4747aadd1cbfa44a978e99d599fb95f28a6d5c0f47f236bf35c6dc",
+    "trading/app/cost_research.py": "7872c167585918bf97d4ef4e1474b192526903ad813ec767a5b11e7fda8f822e",
+    "trading/core/config.py": "c69396f625abbcce21fafc5331d95284284a380250d1a4b0d02aa509f7d052a8",
+    "trading/core/marketdata.py": "9924421a44e6c2a5fcfc183fede7524ff6ee19de2f0e908ea3b824481515f6c7",
+    "trading/core/money.py": "2beac98bafd84ebb2da0ab5016902b6c682125e070622f41064ea4bb30a649d5",
+    "trading/strategy/context.py": "bb1d04d0be58e5ac4ef850dd629163280a51886cb856dfa413ad6033f9377f39",
+    "trading/strategy/cost_aware.py": "552d80c002415e77e050bb95d84df3e509413c427e0a1b75020f93fbb28c29c0",
+    "trading/strategy/indicators.py": "7cefe7ef52f151f7de1aa7b4794bfc7c154cd78a2bfe41011d7c3c6b13bbd72c",
+    "trading/strategy/signals.py": "9f6e08cf24ea2bde0f8d14ce347fd3da9912559d2c2994c4f445e349027e554c"
+  },
+  "limitations": [
+    "previously explored development source, not fresh out-of-sample evidence",
+    "incomplete source; independent complete runs only; short and selectively available periods",
+    "cost assumptions are not verified account fees; taxes/TDS and latency not modelled",
+    "fresh independent confirmation and forward paper testing still required"
+  ],
+  "minimum_period_minutes": 4320,
+  "periods": [
+    {
+      "candle_count": 6076,
+      "development_run": 1,
+      "end_exclusive": "2026-07-09T09:00:00+00:00",
+      "start": "2026-07-05T03:44:00+00:00",
+      "trade_start": "2026-07-06T05:44:00+00:00"
+    },
+    {
+      "candle_count": 5011,
+      "development_run": 4,
+      "end_exclusive": "2026-08-01T23:57:00+00:00",
+      "start": "2026-07-29T12:26:00+00:00",
+      "trade_start": "2026-07-30T14:26:00+00:00"
+    },
+    {
+      "candle_count": 6465,
+      "development_run": 5,
+      "end_exclusive": "2026-08-06T11:43:00+00:00",
+      "start": "2026-08-01T23:58:00+00:00",
+      "trade_start": "2026-08-03T01:58:00+00:00"
+    },
+    {
+      "candle_count": 6771,
+      "development_run": 7,
+      "end_exclusive": "2026-08-11T04:42:00+00:00",
+      "start": "2026-08-06T11:51:00+00:00",
+      "trade_start": "2026-08-07T13:51:00+00:00"
+    },
+    {
+      "candle_count": 14990,
+      "development_run": 20,
+      "end_exclusive": "2026-09-03T01:15:00+00:00",
+      "start": "2026-08-23T15:25:00+00:00",
+      "trade_start": "2026-08-24T17:25:00+00:00"
+    }
+  ],
+  "protected_ml_segment_7_accessed": false,
+  "python": "3.11.15",
+  "risk": {
+    "initial_equity": "10000",
+    "max_daily_loss": "100",
+    "max_notional": "1000",
+    "risk_fraction_per_trade": "0.005"
+  },
+  "schema": "cost-aware-development-plan/v1",
+  "scope": "development_only",
+  "selection": "no tuning; all six disclosed; no automatic promotion",
+  "source_file_sha256": "2c36a429413621ca33788fd627999658c9afccc98c4f184b994c05d9cbd5a871",
+  "warmup_minutes": 1560
+}
