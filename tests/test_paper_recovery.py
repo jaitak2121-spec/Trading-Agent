@@ -24,6 +24,10 @@ class InterruptedPaperPositionRecoveryTest(unittest.TestCase):
                     break
             self.assertTrue(app.stack.portfolio.open_positions())
             self.assertEqual(app.stack.orders.open_orders(), [])
+            # Exercise legacy databases which predate durable venue inventory.
+            app.stack.persistence.connection.execute(
+                "DELETE FROM metadata WHERE key='paper_venue'"
+            )
         finally:
             app.stop()
 
@@ -54,6 +58,7 @@ class InterruptedPaperPositionRecoveryTest(unittest.TestCase):
                 self.assertTrue(recovered.stack.startup.ok)
                 self.assertTrue(recovered.stack.monitor.status().ready)
                 self.assertEqual(recovered.stack.portfolio.open_positions(), [])
+                recovered.resume(reason='operator verified paper recovery')
                 soak = run_soak(recovered, cycles=19)
                 self.assertTrue(soak.passed, soak.failures)
                 actions = [record.action for record in recovered.stack.audit.records()]

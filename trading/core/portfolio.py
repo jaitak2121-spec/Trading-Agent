@@ -266,6 +266,9 @@ class Portfolio:
             raise TypeError("ledger must be a PositionLedger")
         self._currency = cash.currency
         self._cash = cash
+        self.starting_cash = cash
+        self.fees = Money.zero(cash.currency)
+        self.fee_bps = 0
         self._ledger = ledger if ledger is not None else PositionLedger()
         # Absent keys read as "basis unknown", which is the right answer for a
         # ledger that arrived already holding positions: we did not see those
@@ -383,6 +386,14 @@ class Portfolio:
                 cash_delta = price.notional(quantity, rounding=ROUND_DOWN)
 
             self._cash = self._cash + cash_delta
+            fee = Money.rounded(
+                price.amount * quantity.amount * Decimal(self.fee_bps) / Decimal(10000),
+                self._currency, rounding=ROUND_UP,
+            )
+            self._cash = self._cash - fee
+            cash_delta = cash_delta - fee
+            self.fees = self.fees + fee
+            realized = realized - fee
             after = self._ledger.apply_fill(symbol, side, quantity)
             self._accounted[symbol] = after
             if basis is None:
